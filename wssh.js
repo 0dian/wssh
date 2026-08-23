@@ -47,6 +47,8 @@ Tool options:
   --remote-dir <p>   remote bundle dir (default: ~/${DEFAULT_REMOTE_DIR})
   --deploy           install/refresh the remote bundle, then exit
   --debug            enable relay diagnostics on stderr (pollutes the TUI)
+  --dump-stdin       local diagnostic: no ssh, just hex-dump this terminal's
+                     input (and the console modes around it). Quit with Ctrl-].
   -h, --help         this text
 
 Environment:
@@ -70,6 +72,7 @@ function parseArgs(argv) {
   let remoteDir = null;
   let deploy = false;
   let debug = false;
+  let dumpStdin = false;
   const rest = [];
 
   const takesValue = { '-p': 1, '-i': 1, '-J': 1, '-o': 1 };
@@ -80,6 +83,7 @@ function parseArgs(argv) {
       if (a === '-h' || a === '--help') { process.stdout.write(USAGE); process.exit(0); }
       if (a === '--deploy') { deploy = true; continue; }
       if (a === '--debug') { debug = true; continue; }
+      if (a === '--dump-stdin') { dumpStdin = true; continue; }
       if (a === '--remote-dir') {
         remoteDir = argv[++i];
         if (remoteDir === undefined) die('--remote-dir needs a value');
@@ -103,14 +107,14 @@ function parseArgs(argv) {
     if (a === '--' && rest.length === 0) continue;
     rest.push(a);
   }
-  if (!host) {
+  if (!host && !dumpStdin) {
     // No baked-in default host: this is a general-purpose tool, and a personal
     // one belongs in ~/.ssh/config or a shell alias, not in the source.
     die(argv.length === 0
       ? `no host given.\n\n  ${SELF} <host>            # e.g. a Host alias from ~/.ssh/config\n  ${SELF} --help\n`
       : `missing host\n\n${USAGE}`);
   }
-  return { sshOpts, host, remoteDir, deploy, debug, rest };
+  return { sshOpts, host, remoteDir, deploy, debug, dumpStdin, rest };
 }
 
 function die(msg) {
@@ -130,7 +134,187 @@ function sshArgv(extra) {
   return ['-T', '-e', 'none', ...opt.sshOpts, '-o', 'ConnectTimeout=10', opt.host, ...extra];
 }
 
-if (opt.deploy) { deploy(); } else { session(); }
+// ---------------------------------------------------------------------------
+// Windows client: console input mode
+// ---------------------------------------------------------------------------
+// Fixing the remote does not help if the click dies before it ever leaves the
+// client, and on a Windows client it does. libuv implements
+// stdin.setRawMode(true) by rewriting the CONIN$ mode to ENABLE_WINDOW_INPUT
+// and nothing else (0x01F7 -> 0x0008). That drops ENABLE_MOUSE_INPUT and never
+// sets ENABLE_VIRTUAL_TERMINAL_INPUT, which closes both routes a mouse event
+// could have taken into this process: the console will not hand it over as VT
+// bytes, and libuv's reader only turns KEY_EVENT records into stdin data —
+// MOUSE_EVENT records are discarded. Keyboard works, the mouse is silently
+// gone, and the remote never hears about it.
+//
+// OR the mode with ENABLE_VIRTUAL_TERMINAL_INPUT (0x0008 -> 0x0208) and the
+// console stops interpreting and simply forwards what the terminal sent, so the
+// SGR bytes (ESC [ < btn ; col ; row M/m) land in stdin verbatim and get piped
+// to the relay like any other keystroke. Keys are unaffected.
+//
+// This is a client-side console-mode bug, not a terminal-emulator one: Windows
+// Terminal sends the bytes correctly either way.
+//
+// Stock Node exposes no SetConsoleMode, so we borrow PowerShell's P/Invoke for
+// one round trip. -EncodedCommand carries the script past every quoting layer,
+// and the request is passed in the environment rather than baked into the text.
+const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
+
+const PS_CONIN = `
+$ErrorActionPreference = 'Stop'
+try {
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WsshConin {
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  public static extern IntPtr CreateFileW(string name, uint access, uint share,
+      IntPtr sec, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool GetConsoleMode(IntPtr handle, out uint mode);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool SetConsoleMode(IntPtr handle, uint mode);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+# Open the console input buffer by name rather than via GetStdHandle: this
+# helper's own stdin is deliberately not the console. GENERIC_READ |
+# GENERIC_WRITE is spelled in decimal because PowerShell reads the hex literal
+# 0xC0000000 as a *negative* Int32, which then will not convert to a uint.
+$access = [uint32]3221225472
+$h = [WsshConin]::CreateFileW('CONIN$', $access, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+if ($h -eq [IntPtr]::Zero -or $h -eq [IntPtr](-1)) { throw 'cannot open CONIN$' }
+$mode = [uint32]0
+if (-not [WsshConin]::GetConsoleMode($h, [ref]$mode)) { throw 'GetConsoleMode failed' }
+$req = $env:WSSH_CONIN_SET
+if ($req -eq 'query') { $target = $mode }
+elseif ($req) { $target = [uint32]$req }
+else { $target = [uint32]($mode -bor ${ENABLE_VIRTUAL_TERMINAL_INPUT}) }
+if ($target -ne $mode) {
+  if (-not [WsshConin]::SetConsoleMode($h, $target)) { throw 'SetConsoleMode failed' }
+}
+[void][WsshConin]::CloseHandle($h)
+Write-Output ('WSSH_CONIN {0} {1}' -f $mode, $target)
+} catch {
+  # Report on stdout: powershell.exe CLIXML-encodes stderr when it is a pipe,
+  # which would bury the actual message.
+  Write-Output ('WSSH_CONIN_ERR ' + ($_.Exception.Message -replace '\\s+', ' '))
+}
+`;
+
+// req: 'query' to read without touching, a number to set exactly, null to OR in
+// ENABLE_VIRTUAL_TERMINAL_INPUT. Returns {ok, before, after} or {ok:false, why}.
+function conin(req) {
+  const env = Object.assign({}, process.env);
+  env.WSSH_CONIN_SET = req === null || req === undefined ? '' : String(req);
+  // windowsHide must stay false. It makes Node pass CREATE_NO_WINDOW, which
+  // hands the child a brand-new console of its own — the helper would then
+  // faithfully read and patch a throwaway console and report success while the
+  // real one stayed blind. Inheriting our console is the entire point, and it
+  // costs no flashing window precisely because no new console is created.
+  const r = spawnSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-EncodedCommand', Buffer.from(PS_CONIN, 'utf16le').toString('base64'),
+  ], { env, encoding: 'utf8', windowsHide: false, timeout: 20000,
+       stdio: ['ignore', 'pipe', 'pipe'] });
+  if (r.error) return { ok: false, why: r.error.message };
+  const out = String(r.stdout || '');
+  const m = /WSSH_CONIN (\d+) (\d+)/.exec(out);
+  if (m) return { ok: true, before: m[1] >>> 0, after: m[2] >>> 0 };
+  const e = /WSSH_CONIN_ERR (.*)/.exec(out);
+  return { ok: false, why: (e && e[1].trim()) || `powershell exit ${r.status}` };
+}
+
+// The mode CONIN$ was in before anyone touched it, so we can put it back.
+let coninOriginal = null;
+
+// Call before setRawMode(true), while the mode is still pristine.
+function saveConsoleInput() {
+  if (process.platform !== 'win32' || !process.stdin.isTTY) return null;
+  const r = conin('query');
+  if (r.ok) coninOriginal = r.before;
+  return r;
+}
+
+// Call right after setRawMode(true) — raw mode is what clobbers the bits.
+function enableMouseInput() {
+  if (process.platform !== 'win32' || !process.stdin.isTTY) return null;
+  const r = conin(null);
+  if (!r.ok) {
+    process.stderr.write(`${SELF}: cannot enable VT console input (${r.why});` +
+      ` keys will work, the mouse will not.\n`);
+    return null;
+  }
+  return r;
+}
+
+// Call after setRawMode(false). Best effort, and worth doing even though raw
+// mode was just switched off: libuv does not restore what it found, it assigns
+// a fixed ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT
+// (0x0007). Anything else the console had — quick-edit, insert mode, mouse
+// input for whatever runs next — is stock Node's to lose. Since we already know
+// the original and already have the helper, hand the console back untouched.
+function restoreConsoleInput() {
+  if (coninOriginal === null) return null;
+  const want = coninOriginal;
+  coninOriginal = null;
+  return conin(want);
+}
+
+if (opt.dumpStdin) { dumpStdin(); }
+else if (opt.deploy) { deploy(); }
+else { session(); }
+
+// ---------------------------------------------------------------------------
+// --dump-stdin — what does this terminal actually deliver?
+// ---------------------------------------------------------------------------
+// No ssh, no remote, no relay: put stdin in exactly the state a session puts it
+// in and print every byte that arrives. A mouse click should show up as
+// 1b 5b 3c ... 4d/6d. If it does not appear here it never left the client, and
+// no amount of remote debugging will find it.
+function dumpStdin() {
+  const win = process.platform === 'win32';
+  const isTTY = !!process.stdin.isTTY;
+  const say = s => process.stdout.write(s + '\r\n');
+  const hex = n => (n === null ? 'n/a' : '0x' + (n >>> 0).toString(16).padStart(4, '0'));
+  const show = m => (m && m.ok ? `${hex(m.before)} -> ${hex(m.after)}` : `failed: ${m && m.why}`);
+
+  say(`wssh --dump-stdin  platform=${process.platform} node=${process.version} tty=${isTTY}`);
+  const initial = saveConsoleInput();
+  if (win) say(`CONIN initial       ${show(initial)}`);
+  if (isTTY && process.stdin.setRawMode) {
+    try { process.stdin.setRawMode(true); } catch (e) { say(`setRawMode failed: ${e.message}`); }
+  }
+  if (win) say(`CONIN after raw     ${show(conin('query'))}`);
+  const enabled = enableMouseInput();
+  if (win) say(`CONIN after enable  ${show(enabled)}`);
+  say('reading stdin; Ctrl-] or Ctrl-C to stop');
+  say('---');
+
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    say('---');
+    if (isTTY && process.stdin.setRawMode) {
+      try { process.stdin.setRawMode(false); } catch (e) {}
+    }
+    if (win) say(`CONIN after unraw   ${show(conin('query'))}`);
+    if (win) say(`CONIN restored      ${show(restoreConsoleInput())}`);
+    process.stdin.pause();
+    process.exit(0);
+  };
+
+  process.stdin.on('data', buf => {
+    const bytes = Buffer.from(buf);
+    const printable = bytes.toString('latin1').replace(/[\x00-\x1f\x7f]/g, '.');
+    say(`in  ${bytes.length.toString().padStart(3)}  ${bytes.toString('hex').replace(/../g, '$& ').trim()}  |${printable}|`);
+    if (bytes.includes(0x1d) || bytes.includes(0x03)) finish();
+  });
+  process.stdin.on('end', finish);
+  process.stdin.resume();
+}
 
 // ---------------------------------------------------------------------------
 // deploy — best effort, idempotent
@@ -250,7 +434,10 @@ function session() {
   }
   // Raw mode also turns off ISIG, so Ctrl-C reaches the TUI as byte 0x03 rather
   // than killing this wrapper — which is what a TUI expects.
+  saveConsoleInput();
   setRaw(true);
+  // ... and on Windows it also blinds the mouse, so undo that. No-op elsewhere.
+  enableMouseInput();
   process.stdin.resume();
   process.stdin.pipe(ssh.stdin);
   ssh.stdin.on('error', () => {}); // EPIPE once the remote is gone
@@ -275,6 +462,7 @@ function session() {
     if (done) return;
     done = true;
     setRaw(false);
+    restoreConsoleInput(); // no-op off win32
     if (!isTTY) return;
     // Always undo mouse reporting and un-hide the cursor: if the remote died
     // mid-frame nobody else will. Only leave the alternate screen on an abnormal

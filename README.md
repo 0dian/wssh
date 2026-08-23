@@ -49,8 +49,10 @@ The tradeoff: no remote pty means no `SIGWINCH`, so window resizes travel
 
 ## Requirements
 
-**Client** — Node.js (any recent version) and an `ssh` binary. macOS, Linux, or
-Windows Terminal.
+**Client** — Node.js (any recent version) and an `ssh` binary. macOS, Linux and
+Windows are all supported; on a Windows client see
+[the client-side console mode](#the-windows-client-has-the-same-bug) for one
+extra thing wssh has to fix locally.
 
 **Remote** — Windows with Node.js on `PATH`, and a copy of **node-pty built with
 the bundled new ConPTY**, i.e. one containing
@@ -119,6 +121,7 @@ so every byte belongs to the remote program).
 | `--remote-dir <path>` | remote bundle dir, relative to the remote HOME (default `wssh-relay`) |
 | `--deploy` | install/refresh the remote bundle, then exit |
 | `--debug` | relay diagnostics on stderr (will scribble over a TUI) |
+| `--dump-stdin` | diagnostic: no ssh at all, just hex-dump what this terminal delivers to stdin, plus the console modes around it. Quit with Ctrl-]. |
 | `-h`, `--help` | help |
 
 ### Environment
@@ -145,6 +148,48 @@ Ctrl-C is delivered to the remote program as byte `0x03` — correct behaviour f
 a shell or TUI — so it will not kill the client.
 
 ## How it works
+
+### The Windows client has the same bug
+
+Fixing the remote is only half the job: on a Windows *client* the click dies
+before it ever leaves the machine, and for a reason that has nothing to do with
+which terminal emulator you use.
+
+Node's `stdin.setRawMode(true)` — which any interactive client must call — is
+implemented by libuv as a flat overwrite of the console input mode:
+
+```
+CONIN$ mode  0x01F7  ──setRawMode(true)──>  0x0008   (ENABLE_WINDOW_INPUT only)
+```
+
+That drops `ENABLE_MOUSE_INPUT` and never sets
+`ENABLE_VIRTUAL_TERMINAL_INPUT`, which closes both routes a mouse event could
+take into the process: the console will not hand it over as VT bytes, and
+libuv's reader only turns `KEY_EVENT` records into stdin data — `MOUSE_EVENT`
+records are dropped. Keyboard keeps working, so the failure looks like a remote
+problem. It is not; the bytes never existed locally.
+
+So on win32, right after raw mode is set, wssh ORs the mode with
+`ENABLE_VIRTUAL_TERMINAL_INPUT`:
+
+```
+0x0008  ──|= 0x0200──>  0x0208
+```
+
+and the console stops interpreting and simply forwards what the terminal sent,
+so `ESC [ < 0 ; col ; row M` arrives in stdin verbatim and is piped to the relay
+like any keystroke. There is no `SetConsoleMode` in stock Node, so this is one
+`powershell -EncodedCommand` round trip using P/Invoke — no dependency, no
+build step, ~200 ms. If it fails, wssh prints one warning and connects anyway:
+you get a working session without a mouse rather than no session.
+
+The original mode is captured beforehand and restored on exit. That restore is
+worth doing on its own: libuv does not put back what it found either, it assigns
+a fixed `0x0007`, so plain Node silently costs the console its quick-edit and
+insert-mode bits. wssh hands the console back exactly as it was.
+
+Windows Terminal is still the recommendation — but as a terminal it was never
+the problem here, and this fix is independent of it.
 
 ### In-band resize protocol
 
@@ -194,10 +239,12 @@ any Windows account.
   remote, plain `ssh -t` already works.
 - **Aimed at Windows 10 / unpatched Win32-OpenSSH.** On a system whose ConPTY
   already forwards mouse input, you do not need this.
-- **A Windows *client* must use Windows Terminal** (or another VT-capable host).
-  The legacy conhost window reproduces the very same mouse loss on the client
-  side — fixing the server does not help if your local terminal is blind.
-  *(Untested: the Windows client path has not been exercised end to end.)*
+- **A Windows client needs PowerShell on PATH.** That is where the one-shot
+  `SetConsoleMode` helper runs; see
+  [the client-side console mode](#the-windows-client-has-the-same-bug). Without
+  it you still get a session, just no mouse, and a warning saying so. Windows
+  Terminal remains the recommended host, but the console-mode fix is what makes
+  the mouse work and it is independent of the terminal.
 - **TUI capability probes.** Some applications only enable mouse reporting after
   the terminal answers `ESC [ c` (Device Attributes). Real terminals always do,
   so interactive use is fine — but piping the output to a file will not get you

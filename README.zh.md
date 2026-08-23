@@ -45,7 +45,9 @@ ConPTY 足够新，鼠标序列能正常通过。
 
 ## 环境要求
 
-**客户端** — Node.js（较新版本即可）和 `ssh`。macOS、Linux 或 Windows Terminal。
+**客户端** — Node.js（较新版本即可）和 `ssh`。macOS、Linux、Windows 都支持；
+Windows 客户端另有一处必须在本地修掉的东西，见
+[Windows 客户端也有同一个 bug](#windows-客户端也有同一个-bug)。
 
 **远端** — Windows，`PATH` 里有 Node.js，以及一份**带新版 ConPTY 的 node-pty**，
 也就是包含 `build/Release/conpty/conpty.dll` 的那种。系统自带的 ConPTY 正是我们要
@@ -108,6 +110,7 @@ wssh [选项] [user@]host [-- 命令 [参数...]]
 | `--remote-dir <path>` | 远端 bundle 目录，相对远端 HOME，默认 `wssh-relay` |
 | `--deploy` | 安装/刷新远端组件后退出 |
 | `--debug` | 远端 relay 诊断输出到 stderr（会画花 TUI） |
+| `--dump-stdin` | 诊断用：完全不连 ssh，只把本地终端送进 stdin 的字节按十六进制打出来，并打印前后的控制台模式。Ctrl-] 退出。 |
 | `-h`, `--help` | 帮助 |
 
 ### 环境变量
@@ -133,6 +136,44 @@ wssh --remote-dir tools/wssh-relay my-box
 作为 `0x03` 字节交给远端程序（shell / TUI 应有的行为），不会杀掉客户端。
 
 ## 原理
+
+### Windows 客户端也有同一个 bug
+
+只修远端只做了一半：在 Windows *客户端*上，鼠标点击根本没能离开这台机器，而且原因
+跟你用哪个终端模拟器毫无关系。
+
+任何交互式客户端都必须调用的 `stdin.setRawMode(true)`，libuv 在 win32 上的实现是
+把控制台输入模式整个覆盖掉：
+
+```
+CONIN$ mode  0x01F7  ──setRawMode(true)──>  0x0008   （只剩 ENABLE_WINDOW_INPUT）
+```
+
+这既丢掉了 `ENABLE_MOUSE_INPUT`，也从没开过
+`ENABLE_VIRTUAL_TERMINAL_INPUT`，于是鼠标事件进入进程的两条路同时被堵死：控制台
+不会把它当作 VT 字节交出来，而 libuv 的读取端只把 `KEY_EVENT` 翻译成 stdin 数据，
+`MOUSE_EVENT` 直接丢弃。键盘照常工作，所以现象看起来像是远端的问题——不是，那些
+字节在本地就不曾存在过。
+
+所以在 win32 上，raw 模式设好之后，wssh 紧接着把模式或上
+`ENABLE_VIRTUAL_TERMINAL_INPUT`：
+
+```
+0x0008  ──|= 0x0200──>  0x0208
+```
+
+控制台就不再自作主张翻译，而是原样转发终端发来的东西，`ESC [ < 0 ; 列 ; 行 M`
+逐字节落进 stdin，然后和普通按键一样被送给 relay。Node 本身没有 `SetConsoleMode`，
+所以这里是一次 `powershell -EncodedCommand` 的 P/Invoke 往返——零依赖、无需编译、
+约 200 毫秒。万一失败，wssh 只打一行警告然后照常连接：宁可给你一个没有鼠标的可用
+会话，也不要没有会话。
+
+原始模式会在动手之前记下来，退出时还回去。这个还原本身就值得做：libuv 也不还原它
+看到的模式，而是写死成 `0x0007`，所以裸 Node 会悄悄让控制台丢掉快速编辑和插入模式
+这些位。wssh 把控制台原样交还。
+
+Windows Terminal 仍然是推荐的宿主——但在这件事上它从来不是问题所在，这个修复也跟
+它无关。
 
 ### 带内 resize 协议
 
@@ -174,9 +215,10 @@ Windows 上解析不了）；中继的 cwd 用 `$USERPROFILE`。同一份 bundle
   就好使。
 - **面向 Windows 10 / 未打补丁的 Win32-OpenSSH**。如果你的系统 ConPTY 已经能转发
   鼠标，就不需要这个工具。
-- **Windows *客户端*必须用 Windows Terminal**（或其他支持 VT 的宿主）。传统 conhost
-  窗口会在客户端这一侧重现同样的鼠标丢失——远端修好了，本地终端瞎了也没用。
-  *（未实测：Windows 客户端整条路径没有端到端跑过。）*
+- **Windows 客户端需要 PATH 上有 PowerShell**。那次性的 `SetConsoleMode` helper
+  就在那儿跑，见 [Windows 客户端也有同一个 bug](#windows-客户端也有同一个-bug)。
+  没有它你照样能开会话，只是没有鼠标，并且会看到一行警告。Windows Terminal 依然是
+  推荐宿主，但让鼠标能用的是那个控制台模式修复，跟终端本身无关。
 - **TUI 的终端能力探测**。有些程序只有在终端回应了 `ESC [ c`（Device Attributes）
   之后才开启鼠标上报。真实终端都会回应，所以交互使用没问题；但把输出重定向到文件
   就没有鼠标。
