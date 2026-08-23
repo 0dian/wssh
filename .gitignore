@@ -1,0 +1,6 @@
+# Machine-specific convenience shims kept next to the tool but not shipped.
+/herdr-*
+/local-*
+
+.DS_Store
+node_modules/

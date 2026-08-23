@@ -1,0 +1,21 @@
+#!/bin/sh
+# Thin shim: find Node, run wssh.js next to this script.
+set -e
+# Resolve symlinks so this works when invoked via e.g. /opt/homebrew/bin/wssh.
+SELF=$0
+while [ -L "$SELF" ]; do
+  LINK=$(readlink "$SELF")
+  case $LINK in
+    /*) SELF=$LINK ;;
+    *)  SELF=$(dirname "$SELF")/$LINK ;;
+  esac
+done
+DIR=$(cd "$(dirname "$SELF")" && pwd)
+NODE=${WSSH_NODE:-}
+if [ -z "$NODE" ]; then NODE=$(command -v node 2>/dev/null || true); fi
+if [ -z "$NODE" ]; then
+  echo "wssh: no 'node' on PATH." >&2
+  echo "  Install Node, or set WSSH_NODE=/full/path/to/node" >&2
+  exit 127
+fi
+exec "$NODE" "$DIR/wssh.js" "$@"
