@@ -97,11 +97,21 @@ const HOSTKEYS = [fs.readFileSync(HOSTKEY)];
 // key proper begins at the first token that looks like a key type.
 // ---------------------------------------------------------------------------
 const KEYTYPE = /^(ssh-|ecdsa-|sk-)/;
+// administrators_authorized_keys is ACL'd to Administrators + SYSTEM. A task
+// started with a UAC-filtered (non-elevated) token cannot read it, and every
+// key that lives only there then "does not exist". Say so in the log instead
+// of failing silently — and register the task with RunLevel Highest.
+const unreadable = new Set();
 function loadAuthorizedKeys() {
   const out = [];
   for (const file of AUTHKEYS) {
     let text;
-    try { text = fs.readFileSync(file, 'utf8'); } catch (e) { continue; }
+    try { text = fs.readFileSync(file, 'utf8'); }
+    catch (e) {
+      if (e.code !== 'ENOENT' && !unreadable.has(file)) { unreadable.add(file); log('authorized_keys UNREADABLE ' + file + ': ' + e.code + ' (run wsshd elevated: task RunLevel Highest)'); }
+      continue;
+    }
+    unreadable.delete(file);
     for (const raw of text.split(/\r?\n/)) {
       const line = raw.trim();
       if (!line || line[0] === '#') continue;
@@ -234,4 +244,5 @@ function listen(addr) {
   srv.listen(PORT, addr, () => log('listening on ' + addr + ':' + PORT + ' shell=' + SHELL));
 }
 log('wsshd starting pid=' + process.pid + ' authkeys=' + AUTHKEYS.join(';'));
+log('authorized keys loaded at startup: ' + loadAuthorizedKeys().map(a => a.comment).join(', '));
 BIND.forEach(listen);

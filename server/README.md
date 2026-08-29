@@ -48,6 +48,11 @@ everything depends on. Never `npm install` in `~/wssh-relay` directly.
 4. Run it under the user's logon as a Scheduled Task (`Register-ScheduledTask`,
    action `node.exe C:\Users\<u>\wssh-relay\wsshd.js`, hidden, restart on failure,
    no execution time limit). It must run in the user's session, not as a service.
+   **Principal must be `-RunLevel Highest`**: `administrators_authorized_keys` is
+   ACL'd to Administrators + SYSTEM, and a task with a UAC-filtered token cannot
+   read it — every key that lives only there is then rejected as "no matching
+   key". The startup log line `authorized keys loaded at startup:` tells you
+   which keys it actually sees; `authorized_keys UNREADABLE` means this.
 5. Client side: `ssh -p 2222 <user>@<tailnet-ip>`, or through a jump host /
    reverse tunnel that targets `127.0.0.1:2222` (there is no `::1` listener, so
    do not write `localhost:2222` in an `ssh -R`).
