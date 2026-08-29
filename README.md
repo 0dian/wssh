@@ -229,6 +229,27 @@ with `pwd -W` (Git Bash reports `/c/Users/...`, which Node on Windows cannot
 resolve); the relay's cwd comes from `$USERPROFILE`. The same bundle works under
 any Windows account.
 
+## wsshd — the same fix on the server side
+
+`wssh` needs Node on the *client*. When you do not control the client — a phone
+app such as Moshi or Termius, or a plain `ssh -t` from a machine you cannot
+install things on — run the fix on the Windows host instead: **`wsshd`** is a
+small SSH server (`server/wsshd.js`, built on `ssh2`) that answers pty requests
+with a session inside the same modern ConPTY relay.js uses. Any stock client
+that asks for a pty then gets a shell where TUIs receive mouse input.
+
+```
+phone / ssh -t  ──SSH──►  wsshd :2222  ──ConPTY(conpty.dll)──►  bash / herdr
+```
+
+It runs **next to** the stock sshd, never instead of it: port 22 keeps serving
+scp, VS Code Remote and automation. wsshd is public-key only (it reads the same
+`authorized_keys` files as sshd), does shell / exec / pty / env / window-change,
+and deliberately has no sftp, port forwarding or agent forwarding. Full deploy
+notes, the required `RunLevel Highest` scheduled task, and the `npm install`
+trap that deletes the bundled node-pty are in [server/README.md](server/README.md).
+`server/mousetest.js` is a probe that proves mouse bytes arrive without a human.
+
 ## Limitations
 
 - **Cold start.** A fresh ConPTY plus the SSH handshake takes roughly 6–11
@@ -260,6 +281,8 @@ any Windows account.
 rm -f /usr/local/bin/wssh
 rm -rf ~/wssh
 ssh my-box 'rm -rf "$HOME/wssh-relay"'
+# if wsshd was deployed: also unregister its scheduled task on the host
+# powershell Unregister-ScheduledTask -TaskName wsshd -Confirm:$false
 ```
 
 ## License

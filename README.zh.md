@@ -206,6 +206,25 @@ Windows 上也不导出，不补的话 shell 会以为自己在哑终端里—�
 Windows 上解析不了）；中继的 cwd 用 `$USERPROFILE`。同一份 bundle 拷到任何 Windows
 账户下都能用。
 
+## wsshd —— 同一个修法搬到服务端
+
+`wssh` 要求**客户端**有 Node。客户端不由你掌控时——手机上的 Moshi、Termius，
+或者一台装不了东西的机器上的普通 `ssh -t`——就把修法放到 Windows 主机上：
+**`wsshd`**（`server/wsshd.js`，基于 `ssh2`）是一个小 SSH 服务，收到 pty 请求后
+用和 relay.js 相同的新版 ConPTY 起会话。任何申请 pty 的普通客户端连上来，TUI
+里的鼠标都能用。
+
+```
+手机 / ssh -t  ──SSH──►  wsshd :2222  ──ConPTY(conpty.dll)──►  bash / herdr
+```
+
+它和系统自带的 sshd **并排跑**，不是替代：22 端口照旧服务 scp、VS Code Remote
+和自动化。wsshd 只认公钥（读的是 sshd 同一份 `authorized_keys`），支持
+shell / exec / pty / env / window-change，刻意不做 sftp、端口转发和 agent 转发。
+部署步骤、必须以 `RunLevel Highest` 运行的计划任务、以及 `npm install` 会删掉
+自带 node-pty 的坑，都在 [server/README.md](server/README.md)。
+`server/mousetest.js` 是一个探针，不用人手就能证明鼠标字节到没到。
+
 ## 已知限制
 
 - **冷启动慢**。新建 ConPTY 加上 SSH 握手，第一个提示符大约要 6–11 秒。客户端会先
@@ -232,6 +251,8 @@ Windows 上解析不了）；中继的 cwd 用 `$USERPROFILE`。同一份 bundle
 rm -f /usr/local/bin/wssh
 rm -rf ~/wssh
 ssh my-box 'rm -rf "$HOME/wssh-relay"'
+# 部署过 wsshd 的话，主机上再注销它的计划任务
+# powershell Unregister-ScheduledTask -TaskName wsshd -Confirm:$false
 ```
 
 ## 许可证
