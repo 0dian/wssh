@@ -25,8 +25,19 @@ ROWS="$2"; [ -n "$ROWS" ] || ROWS=40
 if [ $# -eq 0 ]; then
   # Default: interactive login shell. -l so it reads the profile and gets the
   # full Git Bash PATH — `ssh -T` gave us a non-login, non-interactive env.
-  SH=${WSSH_SHELL:-$SHELL}
-  [ -n "$SH" ] || SH=bash
+  #
+  # $SHELL is only trusted when it names a POSIX shell. Win32-OpenSSH exports
+  # SHELL as its DefaultShell, so on a host whose default shell is PowerShell
+  # it reads "C:\...\powershell.exe" -- and "powershell.exe -l -i" is an
+  # error, not a shell. Anything unrecognised falls back to bash.
+  SH=$WSSH_SHELL
+  if [ -z "$SH" ]; then
+    NAME=$(printf '%s' "${SHELL:-}" | tr '\\' '/'); NAME=${NAME##*/}; NAME=${NAME%.exe}
+    case "$NAME" in
+      sh|bash|zsh|dash|ksh|ash|fish) SH=$SHELL ;;
+      *) SH=bash ;;
+    esac
+  fi
   set -- "$SH" -l -i
 fi
 
