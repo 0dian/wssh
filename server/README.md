@@ -12,8 +12,10 @@ Use `wsshd` when you don't control the client.
 
 ## What it does / does not do
 
-- Listens on `WSSHD_BIND` (default `127.0.0.1,100.81.19.53`) port `WSSHD_PORT` (2222).
+- Listens on `WSSHD_BIND` (default `127.0.0.1`) port `WSSHD_PORT` (2222).
   Bind it to loopback and the tailnet IP only; never to a public interface.
+  To reach it from a phone or other device, add your tailnet IP to `WSSHD_BIND`,
+  e.g. `WSSHD_BIND=127.0.0.1,100.x.y.z`.
 - **Public-key auth only**, against the same files sshd reads
   (`C:\ProgramData\ssh\administrators_authorized_keys` and `~/.ssh/authorized_keys`),
   re-read on every attempt. Passwords are never accepted.

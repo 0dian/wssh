@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // wssh — Windows ssh: an interactive remote shell (or any program) on a
 // Windows host, running in a ConPTY that actually forwards mouse input.
 //

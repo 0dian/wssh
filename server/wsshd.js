@@ -9,7 +9,7 @@
 // (a phone app, plain `ssh -t`) gets a mouse-capable shell with nothing
 // installed locally.
 //
-//   node wsshd.js            # listens on WSSHD_BIND:WSSHD_PORT (127.0.0.1,<tailnet ip>:2222)
+//   node wsshd.js            # listens on WSSHD_BIND:WSSHD_PORT (default 127.0.0.1:2222; set WSSHD_BIND to add a tailnet IP)
 //
 // Scope, deliberately small: publickey auth only (same authorized_keys files
 // as sshd), shell / exec / pty / env / window-change. No sftp, no port
@@ -29,7 +29,7 @@ const { StringDecoder } = require('string_decoder');
 // ---------------------------------------------------------------------------
 const HOME = process.env.USERPROFILE || os.homedir();
 const PORT = parseInt(process.env.WSSHD_PORT || '2222', 10);
-const BIND = (process.env.WSSHD_BIND || '127.0.0.1,100.81.19.53').split(',').map(s => s.trim()).filter(Boolean);
+const BIND = (process.env.WSSHD_BIND || '127.0.0.1').split(',').map(s => s.trim()).filter(Boolean);
 const HOSTKEY = process.env.WSSHD_HOSTKEY || path.join(HOME, '.ssh', 'wsshd_host_ed25519');
 const AUTHKEYS = (process.env.WSSHD_AUTHKEYS ||
   [path.join(process.env.ProgramData || 'C:\\ProgramData', 'ssh', 'administrators_authorized_keys'),

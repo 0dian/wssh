@@ -61,7 +61,15 @@ Windows 客户端另有一处必须在本地修掉的东西，见
 ## 安装
 
 ```sh
-git clone https://github.com/<you>/wssh.git ~/wssh
+npm install -g github:0dian/wssh   # 然后：wssh --deploy my-box
+```
+
+客户端需要 Node.js ≥ 18 和 git。（npm 包稍后跟上，目前以 GitHub 安装为准。）
+
+或者不用 npm，直接 clone 仓库：
+
+```sh
+git clone https://github.com/0dian/wssh.git ~/wssh
 chmod +x ~/wssh/wssh
 ln -s ~/wssh/wssh /usr/local/bin/wssh     # 或者 PATH 里任何位置
 ```
@@ -76,6 +84,7 @@ wssh --deploy my-box
 
 它会在远端建 `~/wssh-relay/`，用已有的这条 SSH 连接上传 `relay.js` 和
 `run-remote.sh`，按上面说的方式解决 node-pty，最后用 `require()` 验证一次。
+用 npm 安装的话 Windows 上直接用 `wssh` 作为入口；用 git clone 的话，
 Windows 上用 `wssh.cmd` 作为入口。
 
 ## 用法

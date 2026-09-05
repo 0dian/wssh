@@ -68,7 +68,16 @@ around, so a node-pty without that file will not help. Two ways to get one:
 ## Install
 
 ```sh
-git clone https://github.com/<you>/wssh.git ~/wssh
+npm install -g github:0dian/wssh   # then: wssh --deploy my-box
+```
+
+This needs Node.js ≥ 18 and `git` on the client. (An npm package will follow;
+the GitHub install is the supported path for now.)
+
+Or, without npm — clone the repo:
+
+```sh
+git clone https://github.com/0dian/wssh.git ~/wssh
 chmod +x ~/wssh/wssh
 ln -s ~/wssh/wssh /usr/local/bin/wssh     # or anywhere on your PATH
 ```
@@ -83,8 +92,9 @@ wssh --deploy my-box
 
 This creates `~/wssh-relay/` on the remote, uploads `relay.js` and
 `run-remote.sh` over the SSH connection you already have, sorts out node-pty as
-described above, and verifies the result by `require()`-ing it. On Windows, use
-`wssh.cmd` as the entry point.
+described above, and verifies the result by `require()`-ing it. On Windows,
+the npm install gives you `wssh` directly as the entry point; with the git
+clone, use `wssh.cmd` instead.
 
 ## Usage
 

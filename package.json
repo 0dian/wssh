@@ -1,0 +1,36 @@
+{
+  "name": "@0dian/wssh",
+  "version": "0.1.0",
+  "description": "SSH into a Windows host and get a shell where mouse input actually works",
+  "license": "MIT",
+  "bin": {
+    "wssh": "./wssh.js"
+  },
+  "files": [
+    "wssh.js",
+    "remote/",
+    "README.zh.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0dian/wssh.git"
+  },
+  "homepage": "https://github.com/0dian/wssh",
+  "bugs": {
+    "url": "https://github.com/0dian/wssh/issues"
+  },
+  "keywords": [
+    "ssh",
+    "windows",
+    "conpty",
+    "mouse",
+    "tui",
+    "terminal"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
