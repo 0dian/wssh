@@ -50,13 +50,26 @@ Use `wsshd` when you don't control the client.
   relay.js, run-remote.sh      # wssh remote half (managed by `wssh --deploy`)
   node_modules/node-pty/       # the node-pty that ships build/Release/conpty/conpty.dll
   wsshd.js, mousetest.js       # this
-  deps/package.json            # {"dependencies": {"ssh2": "^1.16.0"}}
+  deps/package.json            # {"dependencies": {"ssh2": "1.17.0"}}
   deps/node_modules/ssh2       # installed with `cd deps && npm install`
 ```
 
 `ssh2` lives in `deps/` on purpose: running `npm install` in the relay dir itself
 prunes the bundled `node-pty` as "extraneous" — and with it the `conpty.dll`
 everything depends on. Never `npm install` in `~/wssh-relay` directly.
+
+The `ssh2` version is pinned exactly (no `^`) on purpose: `runInPipes()` in
+`wsshd.js` reaches into a handful of ssh2-internal private fields
+(`_chunk`/`_chunkcb`/`_chunkErr`/`_chunkcbErr`) to work around a bug in ssh2
+1.17.0's `CHANNEL_WINDOW_ADJUST` resume path. A `^1.x` range would let a
+routine `npm install` silently pick up a different ssh2 build whose internals
+don't match, and because assigning to a property that no longer exists does
+not throw, the workaround would become a silent no-op — bringing back
+truncated stderr / hung execs with no error anywhere. wsshd checks the
+installed `ssh2` version against a verified whitelist at startup and logs a
+loud warning (never a hard exit) if it doesn't match, plus a one-time
+structural warning if a live channel object is missing the expected private
+fields — watch `wsshd.log` for `WARNING` after any ssh2 upgrade.
 
 ## Deploy (Windows host)
 

@@ -66,6 +66,43 @@ try { ssh2 = require(path.join(__dirname, 'deps', 'node_modules', 'ssh2')); }
 catch (e) { log('cannot load ssh2 (run: cd ' + path.join(__dirname, 'deps') + ' && npm install): ' + e); process.exit(96); }
 try { pty = require(path.join(__dirname, 'node_modules', 'node-pty')); } catch (e) { log('cannot load bundled node-pty: ' + e); process.exit(96); }
 
+// runInPipes() below reaches into a handful of ssh2-internal fields
+// (`_chunk`/`_chunkcb`/`_chunkErr`/`_chunkcbErr`) to steer around a bug in
+// ssh2 1.17.0's CHANNEL_WINDOW_ADJUST resume path (see the comment at the top
+// of runInPipes for the full story). Assigning to a property that no longer
+// exists on a future/older ssh2 build does NOT throw — it just silently
+// becomes a no-op — so a version bump would bring back stderr truncation and
+// the double-channel hang with zero error signal. This whitelist is the only
+// thing standing between "ssh2 got upgraded" and "wsshd is broken and nobody
+// notices". Before adding a version here, actually run it through the ssh2
+// fixture in scratchpad (two channels, large output, md5 compare on both
+// sides) and confirm the workaround still does something.
+const SSH2_VERIFIED = ['1.17.0'];
+(function checkSsh2Version() {
+  let version;
+  try {
+    version = require(path.join(__dirname, 'deps', 'node_modules', 'ssh2', 'package.json')).version;
+  } catch (e) {
+    log('*** WARNING: could not read deps/node_modules/ssh2/package.json to verify its version (' +
+      (e && e.message || e) + '). The private-field workaround in runInPipes() for the ' +
+      'ssh2 1.17.0 CHANNEL_WINDOW_ADJUST bug may be silently broken: watch for truncated ' +
+      'stderr or a hang when both stdout and stderr produce large output at once. ' +
+      'Verified versions: ' + SSH2_VERIFIED.join(', '));
+    return;
+  }
+  if (SSH2_VERIFIED.indexOf(version) === -1) {
+    log('*** WARNING: ssh2 version ' + version + ' is not in the verified list (' +
+      SSH2_VERIFIED.join(', ') + '). runInPipes() relies on ssh2-internal private fields ' +
+      '(_chunk/_chunkcb/_chunkErr/_chunkcbErr) to work around a bug in ssh2 1.17.0; on a ' +
+      'different version those fields may not exist or may mean something else, and the ' +
+      'workaround silently becomes a no-op (no exception). Symptoms if this has regressed: ' +
+      'truncated stderr on exec output, or a hung exec when stdout and stderr both produce ' +
+      'large output at once. Pin ssh2 back to a verified version, or re-run the ssh2 fixture ' +
+      '(scratchpad: two channels, large output, md5 compare) and add this version to ' +
+      'SSH2_VERIFIED once confirmed.');
+  }
+})();
+
 // ---------------------------------------------------------------------------
 // shell: Git Bash. C:\Windows\System32\bash.exe is WSL and must never win.
 // ---------------------------------------------------------------------------
@@ -204,6 +241,14 @@ function runInPty(channel, args, st, peer, what, extraEnv) {
   channel.on('error', e => log(peer + ' channel error: ' + e));
 }
 
+// Set once runInPipes() has checked (and, if needed, warned about) whether
+// the ssh2 Channel actually has the private chunk-slot fields the pump below
+// relies on. The version check above is a proxy (a package.json string);
+// this is the direct structural check on a real channel object — checked
+// once per process, not once per connection, so a broken deploy logs one
+// clear warning instead of spamming the log every exec.
+let ssh2ChunkSlotsWarned = false;
+
 // exec channel for a client that did NOT send pty-req: a clean pipe, not
 // ConPTY. Stock sshd draws this same line on pty-req; TermRover (and any
 // script-driven client) relies on it — no ConPTY banner/OSC bytes ahead of
@@ -289,6 +334,19 @@ function runInPipes(channel, command, st, peer) {
       queue.push({ data: d, err: isErr, src: src });
       pump();
     });
+  }
+  // Direct structural check, once per process: the version check above is a
+  // proxy (it trusts a package.json string); this confirms the channel object
+  // we are actually about to pump against still has the private slots the
+  // cleanup in pump() clears. If it doesn't, that cleanup silently does
+  // nothing on every exec from now on — no exception, no other signal — and
+  // the CHANNEL_WINDOW_ADJUST defects described above are back in play.
+  if (!ssh2ChunkSlotsWarned && !('_chunk' in channel)) {
+    ssh2ChunkSlotsWarned = true;
+    log('*** WARNING: ssh2 Channel object has no _chunk field. The private-field workaround ' +
+      'in runInPipes() (see SSH2_VERIFIED / checkSsh2Version above) is a no-op on this ssh2 ' +
+      'build: expect truncated stderr or a hang on exec commands with large stdout+stderr ' +
+      'output at once. This is logged once per process, not per connection.');
   }
   forward(child.stdout, false);
   forward(child.stderr, true);
