@@ -43,7 +43,22 @@ ConPTY 足够新，鼠标序列能正常通过。
 
 代价：没有远程 pty 就没有 `SIGWINCH`，所以窗口缩放改走[带内协议](#带内-resize-协议)。
 
-## 环境要求
+## 你需要哪一半
+
+同一个修复分成两半，分别处理连接的两端——按你实际能控制哪一端来选：
+
+- **你能控制客户端，且客户端能装 Node** —— 用下面的 `wssh`，走标准的 22
+  端口，远端只需要 Node + node-pty，不需要别的。
+- **你控制不了客户端**（手机上的 SSH App、装不了任何东西的机器）——改用
+  [`wsshd`](#wsshd--同一个修法搬到服务端)，**客户端零安装**；配置方法见
+  [server/README.md](server/README.md)。
+
+这是同一个修复的两端，不是二选一的竞品——同一台主机上两个都部署也没问题。
+
+## 环境要求（wssh）
+
+以下要求只针对 `wssh` 这条路径——还没想好选哪条的话，先看
+[你需要哪一半](#你需要哪一半)。走 wsshd 的话客户端什么都不需要装。
 
 **客户端** — Node.js（较新版本即可）和 `ssh`。macOS、Linux、Windows 都支持；
 Windows 客户端另有一处必须在本地修掉的东西，见
@@ -234,6 +249,16 @@ shell / exec / pty / env / window-change，刻意不做 sftp、端口转发和 a
 自带 node-pty 的坑，都在 [server/README.md](server/README.md)。
 `server/mousetest.js` 是一个探针，不用人手就能证明鼠标字节到没到。
 
+### 手机快速上手
+
+1. 手机上**什么都不装**，只在 App 里新建一个主机：host = 主机的 tailnet
+   IP，port = 2222，认证方式 = 公钥。
+2. 把 App 生成的公钥加进主机的 `authorized_keys`（和 sshd 读的是同一批
+   文件）。
+3. **`WSSHD_BIND` 默认是 `127.0.0.1`**——必须把 tailnet IP 也加进去手机才
+   连得上，例如 `WSSHD_BIND=127.0.0.1,100.x.y.z`。这是最常见的“连不上”
+   原因。
+
 ## 已知限制
 
 - **冷启动慢**。新建 ConPTY 加上 SSH 握手，第一个提示符大约要 6–11 秒。客户端会先
@@ -250,6 +275,15 @@ shell / exec / pty / env / window-change，刻意不做 sftp、端口转发和 a
 - **TUI 的终端能力探测**。有些程序只有在终端回应了 `ESC [ c`（Device Attributes）
   之后才开启鼠标上报。真实终端都会回应，所以交互使用没问题；但把输出重定向到文件
   就没有鼠标。
+- **wsshd 补不出客户端压根没发的鼠标字节。** wsshd 只修了“服务端到 TUI”
+  这一段；如果 SSH App 本身不发送 SGR 鼠标序列，就没有字节可中继。多数
+  安卓 SSH 客户端在触屏上默认不实现 xterm 鼠标上报——先去 App 设置里找
+  “mouse reporting”/“mouse mode”/触摸当鼠标 这类开关。如果确实没有，
+  退而求其次可以给手机接蓝牙/USB 鼠标，看 App 会不会把它转成鼠标序列。
+  怎么判定见 server/README.md 的
+  [Proving the mouse works without a human](server/README.md#proving-the-mouse-works-without-a-human)
+  一节——我们没有具体 App 的实测数据，所以这里刻意不点名任何一个 App 支持
+  或不支持。
 - **Ctrl-C 杀不掉客户端**（raw 模式下它归远端程序）。要强杀请从另一个终端
   `pkill -f wssh.js`。
 - 会话异常结束时客户端仍会关掉鼠标上报、恢复光标；实在不行 `stty sane` 总能救。

@@ -5,12 +5,15 @@
 //
 // Enables xterm mouse reporting (?1003;1006), prints MOUSETEST-READY, dumps every
 // chunk it receives as hex, and prints MOUSE-OK the moment a chunk carries
-// ESC [ <  (an SGR mouse report). Exits 0 on MOUSE-OK, 1 after 8 s without it.
-// Through the stock Win32-OpenSSH pty on an old conhost the bytes never arrive.
+// ESC [ <  (an SGR mouse report). Exits 0 on MOUSE-OK, 1 after MOUSETEST_TIMEOUT ms
+// (default 8 s) without it. Through the stock Win32-OpenSSH pty on an old conhost
+// the bytes never arrive.
 
 'use strict';
 const ENABLE = '\x1b[?1003;1006h';
 const DISABLE = '\x1b[?1003;1006l';
+const envTimeout = Number(process.env.MOUSETEST_TIMEOUT);
+const TIMEOUT_MS = Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 8000;
 let ok = false;
 
 function finish(code) {
@@ -31,4 +34,4 @@ process.stdin.on('data', b => {
     finish(0);
   }
 });
-setTimeout(() => { if (!ok) { process.stdout.write('MOUSE-TIMEOUT\r\n'); finish(1); } }, 8000);
+setTimeout(() => { if (!ok) { process.stdout.write('MOUSE-TIMEOUT\r\n'); finish(1); } }, TIMEOUT_MS);

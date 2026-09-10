@@ -47,7 +47,28 @@ stream, and the relay owns a ConPTY new enough to pass mouse sequences through.
 The tradeoff: no remote pty means no `SIGWINCH`, so window resizes travel
 [in band](#in-band-resize-protocol) instead.
 
-## Requirements
+## Which half do you need?
+
+This repo ships the same fix for both ends of the connection — pick based on
+which side you actually control:
+
+- **You control the client, and it can run Node** — use `wssh` below. It
+  keeps you on the standard port 22, and needs nothing extra on the remote
+  beyond Node + node-pty.
+- **You don't control the client** (a phone SSH app, a machine you can't
+  install anything on) — use
+  [`wsshd`](#wsshd--the-same-fix-on-the-server-side) instead. The client
+  needs **zero installation**; see [server/README.md](server/README.md) for
+  setup.
+
+These are two ends of the same fix, not competing options — nothing stops
+you from deploying both against the same host.
+
+## Requirements (wssh)
+
+These requirements are for the `wssh` path only — see
+[Which half do you need?](#which-half-do-you-need) if you have not picked
+one yet. Going through `wsshd` instead, the client needs nothing at all.
 
 **Client** — Node.js (any recent version) and an `ssh` binary. macOS, Linux and
 Windows are all supported; on a Windows client see
@@ -260,6 +281,16 @@ notes, the required `RunLevel Highest` scheduled task, and the `npm install`
 trap that deletes the bundled node-pty are in [server/README.md](server/README.md).
 `server/mousetest.js` is a probe that proves mouse bytes arrive without a human.
 
+### Quick start from a phone
+
+1. Install **nothing** on the phone; just add a new host in the SSH app:
+   host = the machine's tailnet IP, port = 2222, auth = public key.
+2. Add the key the app generates to the host's `authorized_keys` (the same
+   files sshd already reads).
+3. **`WSSHD_BIND` defaults to `127.0.0.1`** — the phone can only reach it
+   once you add the tailnet IP too, e.g. `WSSHD_BIND=127.0.0.1,100.x.y.z`.
+   This is the single most common reason a phone "can't connect".
+
 ## Limitations
 
 - **Cold start.** A fresh ConPTY plus the SSH handshake takes roughly 6–11
@@ -280,6 +311,17 @@ trap that deletes the bundled node-pty are in [server/README.md](server/README.m
   the terminal answers `ESC [ c` (Device Attributes). Real terminals always do,
   so interactive use is fine — but piping the output to a file will not get you
   a mouse.
+- **wsshd cannot make a client send mouse bytes it never emits.** wsshd only
+  fixes the server-to-TUI half of the path; if the SSH app itself never sends
+  SGR mouse sequences, there is nothing to relay. Most Android SSH clients do
+  not turn touch input into xterm mouse reporting by default — check the
+  app's settings for something like "mouse reporting" / "mouse mode" /
+  treat-touch-as-mouse. If it truly has none, the fallback is pairing a
+  Bluetooth or USB mouse and checking whether the app forwards *that*
+  instead. See [Proving the mouse works without a
+  human](server/README.md#proving-the-mouse-works-without-a-human) in
+  server/README.md for how to tell which case you're in — we have no test
+  data on specific apps, so this deliberately names none as working or not.
 - **Ctrl-C cannot kill the client** (raw mode gives it to the remote program).
   To force-quit, `pkill -f wssh.js` from another terminal.
 - If a session dies abnormally the client still disables mouse reporting and
