@@ -350,7 +350,27 @@ function runInPipes(channel, command, st, peer) {
   }
   forward(child.stdout, false);
   forward(child.stderr, true);
-  channel.on('data', b => { try { child.stdin.write(b); } catch (e) {} });
+  // client -> child. This direction needs its own backpressure, and ssh2's
+  // flow-control window does NOT supply it: lib/server.js CHANNEL_DATA pushes
+  // the chunk into the channel's Readable and, whenever push() returns true,
+  // immediately tops the receive window back up to 2 MB (windowAdjust). With a
+  // 'data' listener attached the push is delivered synchronously, the Readable
+  // never holds anything, push() therefore always returns true, and the window
+  // is granted back for every byte no matter how far behind the child is. So
+  // ignoring write()'s return value here does not park the data in ssh2 — it
+  // parks it in child.stdin's unbounded Writable queue. Measured in the
+  // fixture (client sends flat out, child reads nothing): 100 MB in -> peak
+  // child.stdin.writableLength 99.94 MB, RSS 240 MB; 500 MB in -> 499.94 MB,
+  // RSS 842 MB. Linear, i.e. one `cat > big` over a fast link is an OOM.
+  // Pausing the channel is what actually stops the window from reopening.
+  channel.on('data', b => {
+    try {
+      if (!child.stdin.write(b)) {
+        channel.pause();
+        child.stdin.once('drain', () => { try { channel.resume(); } catch (e) {} });
+      }
+    } catch (e) {}
+  });
   // ConPTY has no EOF concept so runInPty never needs this; a pipe does, or
   // `echo x | ssh host cat` hangs forever waiting for stdin to close.
   // ssh2's Channel is a Duplex: a client EOF surfaces as the readable side
