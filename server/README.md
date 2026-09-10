@@ -22,10 +22,26 @@ Use `wsshd` when you don't control the client.
 - `shell`, `exec`, `pty-req`, `env` (TERM / LANG / LC_* / COLORTERM), `window-change`.
 - Shell is Git Bash (`bash -l -i`; `exec` runs `bash -lc "<cmd>"`). Override with `WSSHD_SHELL`.
 - **No** sftp/scp, port forwarding, agent forwarding, X11. Keep using port 22 for
-  VS Code Remote, scp and automation — `exec` output here carries ConPTY control
-  sequences and CRLF, it is for humans, not scripts.
+  VS Code Remote and scp. `exec` only goes through ConPTY (control sequences,
+  CRLF) when the client also requests a pty; without a pty-req it runs over a
+  clean pipe with stdout/stderr kept separate and the real exit code passed
+  through, same as stock sshd, so it can be parsed by scripts. `exec` also
+  turns off MSYS/Git Bash's argv path-rewriting for the command it runs
+  (`MSYS_NO_PATHCONV=1` and `MSYS2_ARG_CONV_EXCL=*`), so a Windows-style
+  command's own switches — e.g. `cmd.exe /d /s /c "..."` — reach it intact
+  instead of being mangled as POSIX paths, matching stock sshd's behavior;
+  the interactive shell is unaffected and keeps Git Bash's usual path
+  conversion.
 - Host key: `~/.ssh/wsshd_host_ed25519`, generated with `ssh-keygen` on first start.
 - Log: `wsshd.log` next to the script (`WSSHD_LOG`).
+- **Only relays mouse bytes it receives — cannot conjure ones a client never
+  sends.** wsshd fixes the server-to-TUI half of the path; most Android SSH
+  apps do not turn touch input into xterm mouse reporting (`ESC [ < ... M`) by
+  default, so look for a "mouse reporting" / "mouse mode" / touch-as-mouse
+  toggle in the app's settings, and as a fallback try pairing a Bluetooth/USB
+  mouse to see whether the app forwards that instead. Use `mousetest.js`
+  below to find out which case you're in — we have no data on specific apps,
+  so this list intentionally names none as working or not.
 
 ## Layout on the host
 
@@ -67,3 +83,24 @@ ssh -tt -p 2222 user@host node C:/Users/<u>/wssh-relay/mousetest.js
 prints `MOUSETEST-READY`; send the bytes `ESC [ < 0;10;5 M` from the client
 (expect: `send "\x1b\[<0;10;5M"`). `MOUSE-OK` means they arrived. The same
 probe through port 22 on an old conhost ends in `MOUSE-TIMEOUT`.
+
+### Doing it by hand, from a phone
+
+The 8 s timeout above is sized for the automated form; a human tapping a
+touchscreen needs longer, so it is configurable via `MOUSETEST_TIMEOUT`
+(milliseconds, default 8000):
+
+```sh
+# once the phone app is connected to wsshd, at the bash prompt:
+cd ~/wssh-relay && MOUSETEST_TIMEOUT=30000 node mousetest.js
+```
+
+(`cd` first and use the relative filename on purpose — Git Bash's `/c/...`
+path is not one `node.exe` can resolve.) Wait for `MOUSETEST-READY`, then
+tap/drag on the screen, and read the result:
+
+| Output | Meaning |
+|---|---|
+| `MOUSE-OK` | The server-side path is fine; the problem is in the TUI itself (see "TUI capability probes" in the main README's Limitations). |
+| `RX …` lines appear, but no `1b5b3c` in the hex | The app sends *some* bytes, just not SGR mouse ones (could be X10 `1b5b4d`, or arrow keys). |
+| No `RX` line at all when you tap | The app never sends mouse bytes; there is nothing wsshd can do about that. |

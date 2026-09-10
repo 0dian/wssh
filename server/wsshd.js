@@ -21,7 +21,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { StringDecoder } = require('string_decoder');
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,13 @@ const AUTHKEYS = (process.env.WSSHD_AUTHKEYS ||
 const LOGFILE = process.env.WSSHD_LOG || path.join(__dirname, 'wsshd.log');
 const DEFAULT_COLS = 120, DEFAULT_ROWS = 40;
 const ENV_ALLOW = /^(TERM|LANG|LC_[A-Z]+|COLORTERM)$/;
+// exec-only: turn off MSYS/Git Bash's argv path-rewriting for the child
+// process. Without this, a Windows-native command's own switches (e.g.
+// `cmd.exe /d /s /c "..."`) get mangled as if they were POSIX paths and the
+// intended flag is lost — see the dispatch note for the cmd.exe symptom.
+// Interactive `shell` sessions must NOT get this: users rely on the
+// rewriting there (e.g. `node ~/foo.js` resolving a POSIX-style path).
+const EXEC_NO_PATHCONV = { MSYS_NO_PATHCONV: '1', MSYS2_ARG_CONV_EXCL: '*' };
 
 // ---------------------------------------------------------------------------
 // logging
@@ -158,9 +165,9 @@ function authenticate(ctx, peer) {
 // ---------------------------------------------------------------------------
 // session: one ConPTY per shell/exec channel
 // ---------------------------------------------------------------------------
-function runInPty(channel, args, st, peer, what) {
+function runInPty(channel, args, st, peer, what, extraEnv) {
   const cols = st.cols || DEFAULT_COLS, rows = st.rows || DEFAULT_ROWS;
-  const env = Object.assign({}, process.env, { TERM: st.term || 'xterm-256color' }, st.env);
+  const env = Object.assign({}, process.env, { TERM: st.term || 'xterm-256color' }, st.env, extraEnv);
   let p;
   try {
     p = pty.spawn(SHELL, args, {
@@ -197,11 +204,164 @@ function runInPty(channel, args, st, peer, what) {
   channel.on('error', e => log(peer + ' channel error: ' + e));
 }
 
+// exec channel for a client that did NOT send pty-req: a clean pipe, not
+// ConPTY. Stock sshd draws this same line on pty-req; TermRover (and any
+// script-driven client) relies on it — no ConPTY banner/OSC bytes ahead of
+// the command's own output, stdout and stderr kept apart, real exit code.
+function runInPipes(channel, command, st, peer) {
+  const env = Object.assign({}, process.env, { TERM: st.term || 'xterm-256color' }, st.env, EXEC_NO_PATHCONV);
+  const tag = 'exec ' + JSON.stringify(command);
+  let child;
+  try {
+    child = spawn(SHELL, ['-lc', command], {
+      cwd: HOME,           // same cwd as the ConPTY path
+      env,
+      windowsHide: true,   // wsshd runs as a hidden scheduled task in the
+                            // user's interactive session; without this every
+                            // exec would flash a console window on screen.
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    log(peer + ' spawn failed: ' + (e && e.stack || e));
+    try { channel.stderr.write('wsshd: spawn failed: ' + e + '\r\n'); channel.exit(97); channel.end(); } catch (e2) {}
+    return;
+  }
+  log(peer + ' ' + tag + ' pipe');
+
+  // Raw bytes both ways — no StringDecoder, no ConPTY CRLF translation.
+  //
+  // stdout goes out as channel data, stderr as SSH extended-data; ssh2 exposes
+  // them as two independent Writables (`channel` itself and `channel.stderr`)
+  // that nevertheless share one flow-control window (~2 MB) and, in ssh2
+  // 1.17.0, one pair of "pending chunk" slots on the channel object:
+  // `_chunk`/`_chunkcb` for stdout and `_chunkErr`/`_chunkcbErr` for stderr
+  // (lib/Channel.js). When a write does not fit in the remaining window the
+  // rest is parked in the matching slot and the write callback is withheld;
+  // the next CHANNEL_WINDOW_ADJUST resumes it (lib/server.js, the
+  // `if (channel._waitWindow)` block). That resume path has two defects we
+  // have to steer around, both reproduced in the local fixture:
+  //
+  //   a) it tests `_chunk` before `_chunkErr`, so if both sides have a parked
+  //      chunk at the same moment stderr is never resumed — its callback never
+  //      fires, its Writable never dispatches again, the child's stderr stays
+  //      paused and the exec hangs forever;
+  //   b) it never clears a slot after resuming it, so a stale `_chunk` left
+  //      over from a finished stdout write both re-sends those bytes and
+  //      double-calls a spent write callback.
+  //
+  // Both disappear if the two sides are never in flight at once. So instead of
+  // writing from the two 'data' handlers independently, push every chunk onto
+  // one FIFO and let a single pump own the channel: exactly one write is
+  // outstanding at any time, the source stream that produced it stays paused
+  // until it lands (that is the backpressure — no data is accepted that we
+  // cannot yet send), and once it lands the stale slots are cleared so the next
+  // CHANNEL_WINDOW_ADJUST can only ever pick a genuinely pending chunk.
+  // Completion state, declared up here because the pump below consults it.
+  let stdoutEnded = false, stderrEnded = false, childClosed = false;
+  let exitCode = 0, exitSignal = null, finished = false;
+  const queue = [];
+  let writing = false;
+  function pump() {
+    if (writing || finished || queue.length === 0) return;
+    const item = queue.shift();
+    writing = true;
+    try {
+      (item.err ? channel.stderr : channel).write(item.data, () => {
+        // This chunk is fully handed to the protocol. Drop ssh2's pending-chunk
+        // slots so a later window adjustment cannot resurrect it (defect b).
+        channel._chunk = undefined; channel._chunkcb = undefined;
+        channel._chunkErr = undefined; channel._chunkcbErr = undefined;
+        writing = false;
+        try { item.src.resume(); } catch (e) {}
+        pump();
+        finish();
+      });
+    } catch (e) {
+      writing = false;
+      try { item.src.resume(); } catch (e2) {}
+      finish();
+    }
+  }
+  function forward(src, isErr) {
+    src.on('data', d => {
+      // One chunk per source in flight; resumed from the write callback above.
+      try { src.pause(); } catch (e) {}
+      queue.push({ data: d, err: isErr, src: src });
+      pump();
+    });
+  }
+  forward(child.stdout, false);
+  forward(child.stderr, true);
+  channel.on('data', b => { try { child.stdin.write(b); } catch (e) {} });
+  // ConPTY has no EOF concept so runInPty never needs this; a pipe does, or
+  // `echo x | ssh host cat` hangs forever waiting for stdin to close.
+  // ssh2's Channel is a Duplex: a client EOF surfaces as the readable side
+  // ending ('end'), and only some versions also emit 'eof'. Listen for both —
+  // miss it and `echo x | ssh host cat` hangs forever with the data delivered.
+  const closeStdin = () => { try { child.stdin.end(); } catch (e) {} };
+  channel.on('eof', closeStdin);
+  channel.on('end', closeStdin);
+  // a write landing after the child is gone emits EPIPE asynchronously; without
+  // a listener that is an unhandled 'error' event, not a caught exception.
+  child.stdin.on('error', e => log(peer + ' ' + tag + ' stdin: ' + (e && e.code || e)));
+
+  // Exit sequence: only tell the client the command is done once all three
+  // of stdout-ended, stderr-ended, and child-closed have happened — in
+  // whichever order they arrive. Because a source stream stays paused until
+  // its last chunk has been written, 'end' on it means every byte it produced
+  // is already inside ssh2.
+  //
+  // "Inside ssh2" is not "sent", though, and that is the second half of the
+  // truncation bug. channel.end() turns into eof() + close() on the *server*
+  // side of a Channel as soon as the Duplex pre-finishes (lib/Channel.js,
+  // onFinish), and from then on outgoing.state is no longer 'open', which makes
+  // ServerStderr._write() drop whatever is still queued — silently, with the
+  // exit status already sent, so the client sees a clean exit on a truncated
+  // stream. The Duplex's own finish logic covers stdout, but nothing covers
+  // channel.stderr, which is a separate Writable with its own 2 MB buffer.
+  // So end that stream first and only send exit-status + close the channel
+  // once it has actually flushed ('finish' on a Writable with no _final means
+  // every _write callback has fired, i.e. every byte reached the protocol).
+  function closeChannel() {
+    try { channel.exit(exitCode); channel.end(); } catch (e) {}
+  }
+  function finish() {
+    if (finished || !stdoutEnded || !stderrEnded || !childClosed) return;
+    // A source stream can emit 'end' while its last chunk is still sitting in
+    // the FIFO above (pausing a readable does not un-schedule an 'end' that is
+    // already due). Ending channel.stderr here would then make the pump write
+    // after end — one lost chunk and no 'finish' event, i.e. a hang. Wait for
+    // the pump to run dry; it calls finish() again after every chunk.
+    if (writing || queue.length > 0) return;
+    finished = true;
+    log(peer + ' ' + tag + ' pid=' + child.pid + ' exit=' + exitCode + (exitSignal ? ' signal=' + exitSignal : ''));
+    try {
+      if (channel.stderr.writableFinished) closeChannel();
+      else { channel.stderr.once('finish', closeChannel); channel.stderr.end(); }
+    } catch (e) { closeChannel(); }
+  }
+  child.stdout.on('end', () => { stdoutEnded = true; finish(); });
+  child.stderr.on('end', () => { stderrEnded = true; finish(); });
+  child.on('close', (code, signal) => {
+    if (finished) return;
+    childClosed = true;
+    // code is null when the child died from a signal; ssh2's channel.exit()
+    // requires a number, so map that case to a conventional non-zero code
+    // instead of passing null through.
+    exitCode = (code === null) ? 128 : code;
+    exitSignal = signal;
+    finish();
+  });
+  channel.on('close', () => { if (!finished) { finished = true; try { child.kill(); } catch (e) {} try { child.stdout.destroy(); child.stderr.destroy(); } catch (e) {} log(peer + ' ' + tag + ' pid=' + child.pid + ' channel closed'); } });
+  channel.on('error', e => log(peer + ' channel error: ' + e));
+}
+
 function onSession(client, peer, accept) {
   const session = accept();
-  const st = { cols: 0, rows: 0, term: null, env: {}, pty: null };
+  const st = { cols: 0, rows: 0, term: null, env: {}, pty: null, ptyRequested: false };
   session.on('pty', (accept, reject, info) => {
     st.cols = info.cols; st.rows = info.rows; st.term = info.term;
+    st.ptyRequested = true;
     accept && accept();
   });
   session.on('env', (accept, reject, info) => {
@@ -214,7 +374,16 @@ function onSession(client, peer, accept) {
     accept && accept();
   });
   session.on('shell', (accept) => runInPty(accept(), ['-l', '-i'], st, peer, 'shell'));
-  session.on('exec', (accept, reject, info) => runInPty(accept(), ['-lc', info.command], st, peer, 'exec ' + JSON.stringify(info.command)));
+  session.on('exec', (accept, reject, info) => {
+    if (st.ptyRequested) {
+      // client asked for a pty before exec (e.g. `ssh -tt ... mousetest.js`):
+      // keep using the mouse-capable ConPTY path, unchanged.
+      runInPty(accept(), ['-lc', info.command], st, peer, 'exec ' + JSON.stringify(info.command), EXEC_NO_PATHCONV);
+    } else {
+      // no pty-req: clean pipe, script-parsable output (stock sshd behavior).
+      runInPipes(accept(), info.command, st, peer);
+    }
+  });
   session.on('subsystem', (accept, reject, info) => { log(peer + ' subsystem ' + info.name + ' refused'); reject && reject(); });
   session.on('x11', (accept, reject) => reject && reject());
   session.on('auth-agent', (accept, reject) => reject && reject());
