@@ -1,0 +1,12 @@
+#!/bin/sh
+# Thin exec shim: TermRover's fleet script runs
+#   sh -c 'exec <this-path> ... < /dev/tty 3>&- &'
+# We just hand argv straight to the Node implementation next to us.
+#
+# NOTE: a bare `"$(dirname "$0")/termrover-attach.js"` does NOT work here.
+# Every command wsshd execs for TermRover -- pty and pipe alike -- runs with
+# MSYS_NO_PATHCONV=1 (see wsshd.js EXEC_NO_PATHCONV), so MSYS never rewrites
+# a POSIX path like /c/Users/.../termrover-attach.js for native node.exe, and
+# node cannot find it. cygpath -m converts explicitly (C:/Users/...), which
+# MSYS_NO_PATHCONV does not affect, and keeps this shim relocatable.
+exec node "$(cygpath -m "$(dirname "$0")")/termrover-attach.js" "$@"

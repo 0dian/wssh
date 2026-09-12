@@ -22,7 +22,9 @@ Use `wsshd` when you don't control the client.
 - `shell`, `exec`, `pty-req`, `env` (TERM / LANG / LC_* / COLORTERM), `window-change`.
 - Shell is Git Bash (`bash -l -i`; `exec` runs `bash -lc "<cmd>"`). Override with `WSSHD_SHELL`.
 - **No** sftp/scp, port forwarding, agent forwarding, X11. Keep using port 22 for
-  VS Code Remote and scp. `exec` only goes through ConPTY (control sequences,
+  VS Code Remote and scp. The one narrow exception to "no forwarding" is
+  herdr's own session API sockets, for TermRover's herdr fleet — see
+  [TermRover herdr fleet](#termrover-herdr-fleet) below. `exec` only goes through ConPTY (control sequences,
   CRLF) when the client also requests a pty; without a pty-req it runs over a
   clean pipe with stdout/stderr kept separate and the real exit code passed
   through, same as stock sshd, so it can be parsed by scripts. `exec` also
@@ -50,6 +52,8 @@ Use `wsshd` when you don't control the client.
   relay.js, run-remote.sh      # wssh remote half (managed by `wssh --deploy`)
   node_modules/node-pty/       # the node-pty that ships build/Release/conpty/conpty.dll
   wsshd.js, mousetest.js       # this
+  termrover-attach.js          # `herdr terminal attach` shim for TermRover (see below)
+  termrover-attach             # its sh wrapper (must stay executable, next to wsshd.js)
   deps/package.json            # {"dependencies": {"ssh2": "1.17.0"}}
   deps/node_modules/ssh2       # installed with `cd deps && npm install`
 ```
@@ -74,7 +78,8 @@ fields — watch `wsshd.log` for `WARNING` after any ssh2 upgrade.
 ## Deploy (Windows host)
 
 1. `wssh --deploy <host>` first, so `~/wssh-relay/node_modules/node-pty` exists.
-2. Copy `wsshd.js` and `mousetest.js` into `~/wssh-relay/`.
+2. Copy `wsshd.js`, `mousetest.js`, `termrover-attach.js` and `termrover-attach`
+   into `~/wssh-relay/`.
 3. `mkdir deps`, write the `package.json` above, `cd deps && npm install`.
 4. Run it under the user's logon as a Scheduled Task (`Register-ScheduledTask`,
    action `node.exe C:\Users\<u>\wssh-relay\wsshd.js`, hidden, restart on failure,
@@ -87,6 +92,39 @@ fields — watch `wsshd.log` for `WARNING` after any ssh2 upgrade.
 5. Client side: `ssh -p 2222 <user>@<tailnet-ip>`, or through a jump host /
    reverse tunnel that targets `127.0.0.1:2222` (there is no `::1` listener, so
    do not write `localhost:2222` in an `ssh -R`).
+
+## TermRover herdr fleet
+
+TermRover's "herdr agents fleet" works against a Mac out of the box but not
+against Windows: the app assumes a Unix host, and herdr's Windows build lacks
+`terminal attach`. wsshd papers over each gap, narrowly, and only for herdr:
+
+| Gap | What wsshd does |
+|---|---|
+| `herdr session list --json` reports `socket_path` as `C:\...`; TermRover rejects anything non-POSIX ("herdr didn't provide a session API socket") | For exactly that exec, rewrites each `socket_path` to its MSYS spelling (`/c/...`) |
+| TermRover opens the socket by exec'ing `nc -U <sock>` (or ncat/socat/python3); on Windows the API is really the named pipe `\\.\pipe\<socket_path>` | Bridges that exec channel straight to the pipe; also accepts `direct-streamlocal@openssh.com`. Only paths `herdr session list` itself reports are allowed |
+| The attach script checks its child with `ps -o ppid=`; Git Bash's `ps` has no `-o` | Rewrites that one check to an MSYS `ps` equivalent |
+| herdr 0.9.x on Windows refuses `terminal attach` ("not supported on Windows yet") | Points that one invocation at `termrover-attach` |
+
+`termrover-attach` probes the real herdr on **every** run (a throwaway attach
+to a nonexistent id). If herdr still says "not supported on Windows" it
+emulates attach on top of `herdr terminal session control`: frames go to the
+terminal, keys go back, the alternate screen / mouse reporting / bracketed
+paste are set up like herdr's own attach client, wheel and PageUp/PageDown
+become herdr scrollback, `Ctrl+B q` detaches. Any other answer means herdr
+has grown native support, and the shim hands the original argv to it
+untouched — no change needed here the day upstream fixes Windows.
+
+- Force a mode with `TERMROVER_ATTACH_MODE=official|emulate`; point at a
+  different herdr with `HERDR_BIN_PATH`.
+- Log: `termrover-attach.log` next to the script (`TERMROVER_ATTACH_LOG`).
+  The `mode=` line says which path was taken; `in` / `scroll` / `stats` lines
+  show what the phone actually sent.
+- Known limitation: on detach TermRover's script kills the shim with MSYS
+  `kill`, which for a native `node.exe` is sometimes a hard terminate, so the
+  terminal-restore sequence may not be written. The next attach re-initialises
+  the terminal, so nothing visible sticks.
+- Unit test for the input filter: `node tests/termrover-attach-filter.test.js`.
 
 ## Proving the mouse works without a human
 

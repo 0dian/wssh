@@ -13,15 +13,17 @@
 //
 // Scope, deliberately small: publickey auth only (same authorized_keys files
 // as sshd), shell / exec / pty / env / window-change. No sftp, no port
-// forwarding, no agent forwarding, no passwords. It runs next to sshd, never
+// forwarding (one exception: streamlocal to herdr's own session API sockets,
+// see below), no agent forwarding, no passwords. It runs next to sshd, never
 // instead of it: port 22 keeps serving scp, VS Code Remote and automation.
 
 'use strict';
 
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
+const { spawn, spawnSync, execFile } = require('child_process');
 const { StringDecoder } = require('string_decoder');
 
 // ---------------------------------------------------------------------------
@@ -348,7 +350,12 @@ function runInPipes(channel, command, st, peer) {
       'build: expect truncated stderr or a hang on exec commands with large stdout+stderr ' +
       'output at once. This is logged once per process, not per connection.');
   }
-  forward(child.stdout, false);
+  // herdr session list: small JSON, buffered whole so socket_path can be
+  // rewritten (see msysSocketPaths) and queued once on 'end'.
+  const rewrite = HERDR_SESSION_LIST.test(command);
+  const held = [];
+  if (rewrite) child.stdout.on('data', d => held.push(d));
+  else forward(child.stdout, false);
   forward(child.stderr, true);
   // client -> child. This direction needs its own backpressure, and ssh2's
   // flow-control window does NOT supply it: lib/server.js CHANNEL_DATA pushes
@@ -418,7 +425,14 @@ function runInPipes(channel, command, st, peer) {
       else { channel.stderr.once('finish', closeChannel); channel.stderr.end(); }
     } catch (e) { closeChannel(); }
   }
-  child.stdout.on('end', () => { stdoutEnded = true; finish(); });
+  child.stdout.on('end', () => {
+    if (rewrite) {
+      const out = msysSocketPaths(Buffer.concat(held));
+      if (out.length) { queue.push({ data: out, err: false, src: child.stdout }); pump(); }
+      log(peer + ' ' + tag + ' socket_path -> msys');
+    }
+    stdoutEnded = true; finish();
+  });
   child.stderr.on('end', () => { stderrEnded = true; finish(); });
   child.on('close', (code, signal) => {
     if (finished) return;
@@ -453,13 +467,17 @@ function onSession(client, peer, accept) {
   });
   session.on('shell', (accept) => runInPty(accept(), ['-l', '-i'], st, peer, 'shell'));
   session.on('exec', (accept, reject, info) => {
+    const command = termroverCompat(info.command, peer);
     if (st.ptyRequested) {
       // client asked for a pty before exec (e.g. `ssh -tt ... mousetest.js`):
       // keep using the mouse-capable ConPTY path, unchanged.
-      runInPty(accept(), ['-lc', info.command], st, peer, 'exec ' + JSON.stringify(info.command), EXEC_NO_PATHCONV);
+      runInPty(accept(), ['-lc', command], st, peer, 'exec ' + JSON.stringify(command), EXEC_NO_PATHCONV);
     } else {
-      // no pty-req: clean pipe, script-parsable output (stock sshd behavior).
-      runInPipes(accept(), info.command, st, peer);
+      // no pty-req: clean pipe, script-parsable output (stock sshd behavior),
+      // except TermRover's `nc -U <herdr socket>` which is bridged to the pipe.
+      const nc = NC_UNIX.exec(command);
+      if (nc) execToHerdrPipe(accept(), nc[1], peer);
+      else runInPipes(accept(), command, st, peer);
     }
   });
   session.on('subsystem', (accept, reject, info) => { log(peer + ' subsystem ' + info.name + ' refused'); reject && reject(); });
@@ -468,12 +486,164 @@ function onSession(client, peer, accept) {
   session.on('signal', (accept, reject) => accept && accept());
 }
 
+// ---------------------------------------------------------------------------
+// streamlocal: herdr session API sockets only
+// ---------------------------------------------------------------------------
+// TermRover's herdr fleet reads socket_path from `herdr session list --json`
+// and opens a direct-streamlocal@openssh.com channel to it. On Windows that
+// path is not a socket: the file only holds "pid:nonce", and herdr serves the
+// API on the named pipe \\.\pipe\<socket_path>. Bridge exactly the paths herdr
+// itself reports (re-read on every request) and refuse everything else, so
+// this never becomes a general-purpose pipe opener.
+const HERDR_BIN = process.env.HERDR_BIN_PATH ||
+  path.join(HOME, 'AppData', 'Local', 'Programs', 'Herdr', 'bin', 'herdr.exe');
+
+// "/c/Users/x", "C:/Users/x" and "C:\Users\x" all name the same file.
+function normPath(p) {
+  const s = String(p || '').replace(/\//g, '\\').replace(/^\\([a-zA-Z])\\/, '$1:\\');
+  return s.toLowerCase();
+}
+
+function herdrSockets(cb) {
+  execFile(HERDR_BIN, ['session', 'list', '--json'], { windowsHide: true, timeout: 10000 }, (err, stdout) => {
+    if (err) return cb(err);
+    try { cb(null, JSON.parse(stdout).sessions.map(s => s.socket_path).filter(Boolean)); }
+    catch (e) { cb(e); }
+  });
+}
+
+// TermRover only trusts a POSIX-looking socket_path: given "C:\...\herdr.sock"
+// it reports "herdr didn't provide a session API socket" and never even asks
+// for the streamlocal channel. So for exactly `herdr session list --json`
+// run over exec, rewrite each socket_path to its MSYS spelling ("/c/...");
+// onStreamLocal() maps that spelling back via normPath(). Anything that does
+// not parse as herdr's session list passes through byte for byte.
+const HERDR_SESSION_LIST = /herdr(?:\.exe)?'?\s+session\s+list\s+--json(?:\s|$)/;
+
+function toMsys(p) {
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
+  return m ? '/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/') : p;
+}
+
+function msysSocketPaths(buf) {
+  let j;
+  try { j = JSON.parse(buf.toString('utf8')); } catch (e) { return buf; }
+  if (!j || !Array.isArray(j.sessions)) return buf;
+  for (const s of j.sessions) if (typeof s.socket_path === 'string') s.socket_path = toMsys(s.socket_path);
+  return Buffer.from(JSON.stringify(j) + '\n');
+}
+
+// TermRover does not use streamlocal at all: it execs
+//   /bin/sh -c 'if command -v nc ...; then exec nc -U '<sock>'; elif ncat ...;
+//              elif socat ...; elif python3 <AF_UNIX relay> ...; fi'
+// and treats the exec channel's stdin/stdout as the socket. None of those can
+// open a Windows named pipe (and python3 here is the WindowsApps stub, exit
+// 49), so take the path out of the nc branch and bridge the exec channel to
+// the pipe ourselves. Same allowlist as streamlocal: herdr's own sockets only.
+const NC_UNIX = /\bnc\s+-U\s+(?:'\\'')?'?([^'\s]+)/;
+
+function execToHerdrPipe(channel, want, peer) {
+  const tag = peer + ' exec nc -U ' + JSON.stringify(want);
+  const fail = (why) => {
+    log(tag + ' ' + why);
+    try { channel.exit(1); channel.end(); } catch (e) {}
+  };
+  herdrSockets((err, socks) => {
+    const hit = !err && socks.find(s => normPath(s) === normPath(want));
+    if (!hit) return fail('refused (' + (err ? 'herdr session list: ' + (err.message || err) : 'not a herdr session socket') + ')');
+    const pipe = net.connect('\\\\.\\pipe\\' + hit);
+    pipe.once('error', e => fail('pipe error: ' + (e.code || e)));
+    pipe.once('connect', () => {
+      pipe.removeAllListeners('error');
+      log(tag + ' -> pipe');
+      // client -> pipe; client EOF half-closes the pipe like SHUT_WR
+      channel.pipe(pipe);
+      // pipe -> client, one write in flight and slots cleared afterwards:
+      // the same ssh2 1.17.0 window-adjust workaround as runInPipes().
+      pipe.on('data', d => {
+        pipe.pause();
+        try {
+          channel.write(d, () => {
+            channel._chunk = undefined; channel._chunkcb = undefined;
+            channel._chunkErr = undefined; channel._chunkcbErr = undefined;
+            pipe.resume();
+          });
+        } catch (e) { pipe.destroy(); }
+      });
+      pipe.on('end', () => { try { channel.exit(0); channel.end(); } catch (e) {} });
+      pipe.on('error', e => fail('pipe error: ' + (e.code || e)));
+      channel.on('close', () => { pipe.destroy(); log(tag + ' closed'); });
+    });
+  });
+}
+
+// TermRover's fleet attach script checks its attach child with
+// `ps -o ppid= -p "$tr_child"`. Git Bash's ps has no -o ("unknown option --
+// o"), so the check is always empty and every attach reports "failed". MSYS
+// ps prints the PPID in columns 10-17 of the row under its header; the
+// replacement adds no quoting of its own, so it survives TermRover's nested
+// quoting untouched.
+const PS_PPID = 'ps -o ppid= -p "$tr_child"';
+const PS_PPID_MSYS = 'ps -p "$tr_child" | sed -n 2p | cut -c10-17';
+
+// TermRover's per-agent script (termrover-login) backgrounds
+// `herdr [--session S] terminal attach <term_id> --takeover` and polls
+// whether that child is still alive. herdr 0.9.0-preview's `terminal attach`
+// is #[cfg(windows)]-disabled and exits immediately, so every attach on this
+// host would report "failed". Route just that one herdr invocation through
+// termrover-attach (see termrover-attach.js), which re-checks on every run
+// whether the real binary has grown Windows support and only falls back to
+// emulating attach via `terminal session control` when it still hasn't.
+const TERMROVER_LOGIN_MARKER = 'termrover-login';
+// Both derived, never hardcoded: TermRover writes herdr's path as `command -v`
+// reports it (MSYS spelling, no .exe); the shim ships next to this file.
+const HERDR_MSYS_PATH = toMsys(HERDR_BIN).replace(/\.exe$/i, '');
+const TERMROVER_ATTACH_MSYS_PATH = toMsys(path.join(__dirname, 'termrover-attach'));
+
+function termroverCompat(command, peer) {
+  if (command.includes(PS_PPID)) {
+    log(peer + ' compat: ps -o ppid= -> msys ps');
+    command = command.split(PS_PPID).join(PS_PPID_MSYS);
+  }
+  if (command.includes(TERMROVER_LOGIN_MARKER) && command.includes(HERDR_MSYS_PATH)) {
+    log(peer + ' compat: herdr -> termrover-attach (terminal attach shim)');
+    command = command.split(HERDR_MSYS_PATH).join(TERMROVER_ATTACH_MSYS_PATH);
+  }
+  return command;
+}
+
+function onStreamLocal(accept, reject, info, peer) {
+  const tag = peer + ' streamlocal ' + JSON.stringify(info.socketPath);
+  herdrSockets((err, socks) => {
+    const hit = !err && socks.find(s => normPath(s) === normPath(info.socketPath));
+    if (!hit) {
+      log(tag + ' refused (' + (err ? 'herdr session list: ' + (err.message || err) : 'not a herdr session socket') + ')');
+      return reject();
+    }
+    const pipe = net.connect('\\\\.\\pipe\\' + hit);
+    pipe.once('error', e => { log(tag + ' pipe error: ' + (e.code || e)); reject(); });
+    pipe.once('connect', () => {
+      pipe.removeAllListeners('error');
+      const ch = accept();
+      log(tag + ' -> pipe');
+      ch.pipe(pipe).pipe(ch);
+      pipe.on('error', e => { log(tag + ' pipe error: ' + (e.code || e)); try { ch.close(); } catch (e2) {} });
+      ch.on('error', e => { log(tag + ' channel error: ' + e); pipe.destroy(); });
+      ch.on('close', () => { pipe.destroy(); log(tag + ' closed'); });
+    });
+  });
+}
+
 function onClient(client, info) {
   const peer = (info.ip || '?') + ':' + (info.port || '?');
   log(peer + ' connected ' + (info.header && info.header.identRaw || ''));
   client.on('authentication', ctx => authenticate(ctx, peer));
-  client.on('ready', () => client.on('session', (accept, reject) => onSession(client, peer, accept)));
-  client.on('request', (accept, reject) => reject && reject()); // tcpip-forward etc.
+  client.on('ready', () => {
+    client.on('session', (accept, reject) => onSession(client, peer, accept));
+    client.on('openssh.streamlocal', (accept, reject, info) => onStreamLocal(accept, reject, info, peer));
+    client.on('tcpip', (accept, reject, info) => { log(peer + ' direct-tcpip ' + info.destIP + ':' + info.destPort + ' refused'); reject && reject(); });
+  });
+  client.on('request', (accept, reject, name) => { log(peer + ' global request ' + name + ' refused'); reject && reject(); }); // tcpip-forward etc.
   client.on('error', e => log(peer + ' client error: ' + (e && e.message || e)));
   client.on('close', () => log(peer + ' closed'));
 }
