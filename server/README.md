@@ -126,6 +126,30 @@ untouched — no change needed here the day upstream fixes Windows.
   the terminal, so nothing visible sticks.
 - Unit test for the input filter: `node tests/termrover-attach-filter.test.js`.
 
+## Tests
+
+Run a `.js` test with `node tests/<file>.js` and a `.py` test with
+`python tests/<file>.py` (Windows: `python`, not `python3`; set
+`PYTHONIOENCODING=utf-8` for the phone-view ones). Paths inside every test
+are derived from `__dirname` / `os.homedir()` / `process.env.HERDR_BIN_PATH`,
+never hardcoded, so they run the same way from this repo's `server/tests/`
+or from the `~/wssh-relay` deploy layout.
+
+### Moshi PowerShell dispatch (20260921-wsshd-moshi-powershell)
+
+- `d1_moshi_dispatch_unit.js` -- unit tests for the `MOSHI_PS` regex in
+  `wsshd.js` that decides whether an exec'd command is one of Moshi's
+  PowerShell probes (dispatch to `powershell.exe`) or an ordinary bash
+  command; includes a UTF-16LE `-EncodedCommand` round-trip check against
+  the real `powershell.exe` on the host.
+- `d2_moshi_e2e.js` -- end-to-end: starts a real, patched `wsshd.js` on a
+  temporary port and runs Moshi's real probe scripts (pulled verbatim from
+  `wsshd.log`) through it, alongside bash and TermRover regression checks
+  on the same instance.
+- `d3_moshi_spawn_error_crash_guard.js` -- crash-guard regression: points
+  `WSSHD_POWERSHELL` at a nonexistent path and asserts the one bad spawn
+  fails cleanly, without crashing wsshd or hanging any other client.
+
 ## Proving the mouse works without a human
 
 ```

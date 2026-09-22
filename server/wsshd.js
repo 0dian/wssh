@@ -127,6 +127,22 @@ const SHELL = findShell();
 if (!SHELL) { log('no Git Bash found; set WSSHD_SHELL'); process.exit(95); }
 
 // ---------------------------------------------------------------------------
+// PowerShell: only for Moshi's Windows-aware probe scripts (see MOSHI_PS
+// below), never a general-purpose alternative shell. Fixed System32 path,
+// same existence-check style as findShell() above, rather than trusting
+// PATH order. Not fatal at startup if missing -- it only breaks Moshi's
+// probes, not the rest of wsshd -- so this logs a warning, not exit().
+// ---------------------------------------------------------------------------
+function findPowerShell() {
+  if (process.env.WSSHD_POWERSHELL) return process.env.WSSHD_POWERSHELL;
+  const fixed = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  if (fs.existsSync(fixed)) return fixed;
+  return null;
+}
+const POWERSHELL = findPowerShell();
+if (!POWERSHELL) log('*** WARNING: no powershell.exe found at the expected System32 path (set WSSHD_POWERSHELL); Moshi PowerShell probes will fail to spawn');
+
+// ---------------------------------------------------------------------------
 // host key
 // ---------------------------------------------------------------------------
 if (!fs.existsSync(HOSTKEY)) {
@@ -255,25 +271,78 @@ let ssh2ChunkSlotsWarned = false;
 // ConPTY. Stock sshd draws this same line on pty-req; TermRover (and any
 // script-driven client) relies on it — no ConPTY banner/OSC bytes ahead of
 // the command's own output, stdout and stderr kept apart, real exit code.
+// Moshi (getmoshi.app) probes a Windows target with PowerShell scripts, not
+// bash -- see the dispatch note in wsshd.js's header comment. Both probe
+// scripts observed in production (__MOSHI_HOOK_PROBE_V2__,
+// __MOSHI_MULTIPLEXER_SNAPSHOT_V1__) start with exactly this line; kept
+// intentionally narrow so no POSIX shell script (which TermRover, the vast
+// majority of exec traffic, only ever sends) can accidentally match.
+const MOSHI_PS = /^\s*\$marker\s*=\s*'__MOSHI_[A-Z0-9_]+_V\d+__'/;
+
 function runInPipes(channel, command, st, peer) {
   const env = Object.assign({}, process.env, { TERM: st.term || 'xterm-256color' }, st.env, EXEC_NO_PATHCONV);
   const tag = 'exec ' + JSON.stringify(command);
+  const viaPowerShell = MOSHI_PS.test(command);
   let child;
   try {
-    child = spawn(SHELL, ['-lc', command], {
-      cwd: HOME,           // same cwd as the ConPTY path
-      env,
-      windowsHide: true,   // wsshd runs as a hidden scheduled task in the
-                            // user's interactive session; without this every
-                            // exec would flash a console window on screen.
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    if (viaPowerShell) {
+      if (!POWERSHELL) throw new Error('no powershell.exe found (set WSSHD_POWERSHELL)');
+      // -EncodedCommand: the probe scripts contain single/double quotes,
+      // backticks and newlines that a -Command <string> would have mangled
+      // going through Windows' argv parsing. Base64 of UTF-16LE is what
+      // powershell.exe itself expects for -EncodedCommand. This also means
+      // the script never touches stdin, so the client->child stdin
+      // forwarding and backpressure below need no special-casing.
+      const encoded = Buffer.from(command, 'utf16le').toString('base64');
+      child = spawn(POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
+        cwd: HOME,           // same cwd as the ConPTY path
+        env,
+        windowsHide: true,   // wsshd runs as a hidden scheduled task in the
+                              // user's interactive session; without this every
+                              // exec would flash a console window on screen.
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } else {
+      child = spawn(SHELL, ['-lc', command], {
+        cwd: HOME,           // same cwd as the ConPTY path
+        env,
+        windowsHide: true,   // wsshd runs as a hidden scheduled task in the
+                              // user's interactive session; without this every
+                              // exec would flash a console window on screen.
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    }
   } catch (e) {
     log(peer + ' spawn failed: ' + (e && e.stack || e));
     try { channel.stderr.write('wsshd: spawn failed: ' + e + '\r\n'); channel.exit(97); channel.end(); } catch (e2) {}
     return;
   }
-  log(peer + ' ' + tag + ' pipe');
+  log(peer + ' ' + tag + (viaPowerShell ? ' pipe(powershell)' : ' pipe'));
+
+  // child_process.spawn() does NOT throw synchronously for a failure that
+  // only shows up once libuv tries to actually launch the process (ENOENT on
+  // the executable, EACCES, etc. -- e.g. WSSHD_POWERSHELL pointed at a path
+  // that does not exist, or findPowerShell()/findShell() returning something
+  // stale). That surfaces as an async 'error' event instead. Both branches
+  // above reach this same point after a successful, synchronous spawn() call
+  // (the try/catch above only ever catches a *synchronous* throw, which is a
+  // different, narrower failure mode -- e.g. bad spawn() options), so one
+  // listener here covers both the powershell and the bash path. Without it
+  // this is an unhandled 'error' event, which is fatal to the whole Node
+  // process -- every other SSH client on this wsshd goes down with it, not
+  // just this one exec. `finished` is the same guard the rest of this
+  // function already uses (finish(), child 'close', channel 'close') so an
+  // 'error' that fires before/instead-of/after 'close' cannot cause channel
+  // methods to be called twice (ssh2 throws on a second exit()/end() on an
+  // already-closed channel).
+  child.on('error', e => {
+    if (finished) return;
+    finished = true;
+    log(peer + ' ' + tag + ' spawn error: ' + (e && e.stack || e));
+    try { child.kill(); } catch (e2) {}
+    try { child.stdout.destroy(); child.stderr.destroy(); } catch (e2) {}
+    try { channel.stderr.write('wsshd: spawn error: ' + (e && e.message || e) + '\r\n'); channel.exit(97); channel.end(); } catch (e2) {}
+  });
 
   // Raw bytes both ways — no StringDecoder, no ConPTY CRLF translation.
   //
