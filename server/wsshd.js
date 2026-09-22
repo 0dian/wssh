@@ -220,12 +220,19 @@ function authenticate(ctx, peer) {
 // ---------------------------------------------------------------------------
 // session: one ConPTY per shell/exec channel
 // ---------------------------------------------------------------------------
-function runInPty(channel, args, st, peer, what, extraEnv) {
+function runInPty(channel, args, st, peer, what, extraEnv, exe, viaPowerShell) {
   const cols = st.cols || DEFAULT_COLS, rows = st.rows || DEFAULT_ROWS;
   const env = Object.assign({}, process.env, { TERM: st.term || 'xterm-256color' }, st.env, extraEnv);
   let p;
   try {
-    p = pty.spawn(SHELL, args, {
+    // Same "no binary found" guard as runInPipes(): findPowerShell() returns
+    // WSSHD_POWERSHELL verbatim without checking existence, so a bogus
+    // override only surfaces once pty.spawn() below actually tries to launch
+    // it. Catching the missing-POWERSHELL case explicitly here (rather than
+    // letting pty.spawn() below throw on a null exe) keeps the failure
+    // message consistent with the pipe path.
+    if (viaPowerShell && !POWERSHELL) throw new Error('no powershell.exe found (set WSSHD_POWERSHELL)');
+    p = pty.spawn(exe || SHELL, args, {
       name: st.term || 'xterm-256color',
       cols, rows,
       cwd: HOME,            // must be a Windows path; a bad cwd makes conpty.dll go silent
@@ -240,7 +247,7 @@ function runInPty(channel, args, st, peer, what, extraEnv) {
   st.pty = p;
   // p.pid is not populated until the conpty agent reports back, so it is only
   // meaningful in the exit line below.
-  log(peer + ' ' + what + ' ' + cols + 'x' + rows);
+  log(peer + ' ' + what + ' ' + cols + 'x' + rows + (viaPowerShell ? '(powershell)' : ''));
 
   p.onData(d => { try { channel.write(Buffer.from(d, 'utf8')); } catch (e) {} });
 
@@ -272,12 +279,31 @@ let ssh2ChunkSlotsWarned = false;
 // script-driven client) relies on it — no ConPTY banner/OSC bytes ahead of
 // the command's own output, stdout and stderr kept apart, real exit code.
 // Moshi (getmoshi.app) probes a Windows target with PowerShell scripts, not
-// bash -- see the dispatch note in wsshd.js's header comment. Both probe
-// scripts observed in production (__MOSHI_HOOK_PROBE_V2__,
-// __MOSHI_MULTIPLEXER_SNAPSHOT_V1__) start with exactly this line; kept
-// intentionally narrow so no POSIX shell script (which TermRover, the vast
-// majority of exec traffic, only ever sends) can accidentally match.
-const MOSHI_PS = /^\s*\$marker\s*=\s*'__MOSHI_[A-Z0-9_]+_V\d+__'/;
+// bash -- see the dispatch note in wsshd.js's header comment. Three script
+// shapes observed in production: the two probes (__MOSHI_HOOK_PROBE_V2__,
+// __MOSHI_MULTIPLEXER_SNAPSHOT_V1__), which start with a quoted marker
+// assignment, and the session-attach command (`& $herdr --session '...'`,
+// sent to runInPty once the user picks a session in the client's picker —
+// see 20260922-wsshd-moshi-attach-pty), which starts with a Verb-Noun
+// cmdlet assignment instead (`$herdr = Get-Command ...`). Widened from the
+// marker-only form to: a PowerShell variable assignment (`$name = `) whose
+// right-hand side is either the quoted marker or a Verb-Noun cmdlet call.
+// Still narrow enough that no POSIX shell script can match: bash variable
+// assignment has no spaces around `=` (`x=3`), and `$x = y` in bash means
+// "run the expansion of $x with argument = and y" -- not a real-world
+// pattern. This also keeps `powershell.exe ...` / `powershell -NoProfile
+// -Command ...` commands (bash invoking PowerShell as a subprocess, seen
+// elsewhere in production history) out: the command text itself does not
+// start with `$name =`, so those still dispatch to bash as before.
+const MOSHI_PS = /^\s*\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:'__MOSHI_[A-Z0-9_]+_V\d+__'|[A-Z][a-z]+-[A-Z][A-Za-z]+\b)/;
+
+// Shared by runInPipes() and runInPty(): the one and only place a Moshi
+// PowerShell command's text turns into what powershell.exe -EncodedCommand
+// expects. Both dispatch paths must use the same MOSHI_PS test and the same
+// encoding here so they can never silently drift from each other.
+function moshiEncode(command) {
+  return Buffer.from(command, 'utf16le').toString('base64');
+}
 
 function runInPipes(channel, command, st, peer) {
   const env = Object.assign({}, process.env, { TERM: st.term || 'xterm-256color' }, st.env, EXEC_NO_PATHCONV);
@@ -293,7 +319,7 @@ function runInPipes(channel, command, st, peer) {
       // powershell.exe itself expects for -EncodedCommand. This also means
       // the script never touches stdin, so the client->child stdin
       // forwarding and backpressure below need no special-casing.
-      const encoded = Buffer.from(command, 'utf16le').toString('base64');
+      const encoded = moshiEncode(command);
       child = spawn(POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
         cwd: HOME,           // same cwd as the ConPTY path
         env,
@@ -538,9 +564,24 @@ function onSession(client, peer, accept) {
   session.on('exec', (accept, reject, info) => {
     const command = termroverCompat(info.command, peer);
     if (st.ptyRequested) {
-      // client asked for a pty before exec (e.g. `ssh -tt ... mousetest.js`):
-      // keep using the mouse-capable ConPTY path, unchanged.
-      runInPty(accept(), ['-lc', command], st, peer, 'exec ' + JSON.stringify(command), EXEC_NO_PATHCONV);
+      // client asked for a pty before exec (e.g. `ssh -tt ... mousetest.js`,
+      // or Moshi's session-attach `& $herdr --session '...'` once the user
+      // picks a session -- see 20260922-wsshd-moshi-attach-pty). Moshi's
+      // PowerShell commands need PowerShell, not bash, same judgment as
+      // runInPipes() below. Unlike runInPipes()'s -NonInteractive (a
+      // one-shot probe script), this one must NOT be -NonInteractive:
+      // `& $herdr --session '...'` starts herdr's interactive TUI, and
+      // -NonInteractive would disable the interactive prompts that TUI
+      // needs.
+      const tag = 'exec ' + JSON.stringify(command);
+      if (MOSHI_PS.test(command)) {
+        const encoded = moshiEncode(command);
+        runInPty(accept(), ['-NoProfile', '-EncodedCommand', encoded], st, peer, tag, EXEC_NO_PATHCONV, POWERSHELL, true);
+      } else {
+        // everything else with a pty-req: keep using the mouse-capable
+        // ConPTY bash path, unchanged.
+        runInPty(accept(), ['-lc', command], st, peer, tag, EXEC_NO_PATHCONV);
+      }
     } else {
       // no pty-req: clean pipe, script-parsable output (stock sshd behavior),
       // except TermRover's `nc -U <herdr socket>` which is bridged to the pipe.

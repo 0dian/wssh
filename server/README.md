@@ -150,6 +150,43 @@ or from the `~/wssh-relay` deploy layout.
   `WSSHD_POWERSHELL` at a nonexistent path and asserts the one bad spawn
   fails cleanly, without crashing wsshd or hanging any other client.
 
+### TermRover herdr fleet coverage (backfill for the feature shipped in 4506d0d)
+
+These test the official/emulate detection and the e2e attach/detach replay
+above; they existed on disk since that change but were never added to git.
+
+- `a2_official_detect.js` / `a3_emulate_detect.js` -- termrover-attach's
+  official-vs-emulate mode detection, against a fake herdr build
+  (`fakeherdr-official.cs`, compiled on the fly) and the real one.
+- `a4_e2e_real_attach.js` / `b3_e2e.js` -- full end-to-end TermRover
+  attach/detach replay (scripts lifted verbatim from `wsshd.log`) against a
+  real wsshd + termrover-attach, targeting the named herdr session `sbtest`
+  only, never `default`. `b3_e2e.js` additionally exercises the
+  emulate-mode terminal init/restore sequences and the input filter's
+  scroll/keystroke paths.
+- `start_sbtest.js` -- brings the named herdr session `sbtest` up headless
+  so a4/b3/e2 have a real session to attach to. Run it first; when done,
+  `herdr session stop sbtest` and kill this script's node process (it
+  `setInterval`s to stay alive).
+
+Known flaky: `b3_e2e.js`'s post-detach assertions (`ESC[?1049l` /
+`ESC[?1000l` / the `stats` log line) fail roughly half the time --
+TermRover kills the shim with MSYS `kill` on detach, which for a native
+`node.exe` is sometimes a hard terminate before the restore sequence gets
+written (see "Known limitation" above). Not a regression; re-run if it
+fails alone.
+
+### Moshi pty-path dispatch (20260922-wsshd-moshi-attach-pty)
+
+- `e1_attach_pty_history_scan.js` -- full-history zero-false-positive scan:
+  every distinct `exec` command ever logged to `wsshd.log`, deduplicated
+  and tested against `MOSHI_PS`, asserting only the three known Moshi
+  PowerShell shapes match it.
+- `e2_attach_pty_e2e.js` -- pty-path dispatch end-to-end: sends a pty-req
+  then execs Moshi's real attach command (pulled from `wsshd.log`, targeting
+  `sbtest`) against a real wsshd instance, plus the bash regression and the
+  crash-guard check on the pty path.
+
 ## Proving the mouse works without a human
 
 ```
