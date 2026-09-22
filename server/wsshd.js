@@ -705,19 +705,31 @@ const PS_PPID_MSYS = 'ps -p "$tr_child" | sed -n 2p | cut -c10-17';
 // whether the real binary has grown Windows support and only falls back to
 // emulating attach via `terminal session control` when it still hasn't.
 const TERMROVER_LOGIN_MARKER = 'termrover-login';
-// Both derived, never hardcoded: TermRover writes herdr's path as `command -v`
-// reports it (MSYS spelling, no .exe); the shim ships next to this file.
-const HERDR_MSYS_PATH = toMsys(HERDR_BIN).replace(/\.exe$/i, '');
+// Derived, never hardcoded: the shim ships next to this file.
 const TERMROVER_ATTACH_MSYS_PATH = toMsys(path.join(__dirname, 'termrover-attach'));
+// herdr's own install path is not stable across upgrades (0.9.1-preview moved
+// it from a fixed bin/ dir to a version-hashed release dir under
+// ~/.herdr/packages/...), so comparing against today's HERDR_BIN silently
+// stops matching the moment herdr updates itself. Pull the path straight out
+// of the command text instead: an absolute MSYS ("/c/...") or Windows
+// ("C:\..." / "C:/...") path whose basename is exactly `herdr` or
+// `herdr.exe`, quoted or bare. Non-greedy on the middle segment so a
+// directory literally named `.herdr` along the way isn't mistaken for the
+// basename.
+const HERDR_PATH_IN_CMD =
+  /(?:^|['"\s])((?:\/[a-zA-Z]\/|[a-zA-Z]:[\/\\])[^'"\s]*?herdr)(?:\.exe)?(?=['"\s])/;
 
 function termroverCompat(command, peer) {
   if (command.includes(PS_PPID)) {
     log(peer + ' compat: ps -o ppid= -> msys ps');
     command = command.split(PS_PPID).join(PS_PPID_MSYS);
   }
-  if (command.includes(TERMROVER_LOGIN_MARKER) && command.includes(HERDR_MSYS_PATH)) {
-    log(peer + ' compat: herdr -> termrover-attach (terminal attach shim)');
-    command = command.split(HERDR_MSYS_PATH).join(TERMROVER_ATTACH_MSYS_PATH);
+  if (command.includes(TERMROVER_LOGIN_MARKER)) {
+    const m = HERDR_PATH_IN_CMD.exec(command);
+    if (m) {
+      log(peer + ' compat: herdr -> termrover-attach (terminal attach shim)');
+      command = command.split(m[1]).join(TERMROVER_ATTACH_MSYS_PATH);
+    }
   }
   return command;
 }

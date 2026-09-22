@@ -250,6 +250,21 @@ fails alone.
   lines, box-drawing lines, blank lines, fold-marker lines) and prints which
   corpus it used.
 
+### termroverCompat herdr-path generalization (20260922-wsshd-herdr-path-generic)
+
+- `termrover-compat-herdr-path.test.js` -- regression test for
+  `termroverCompat()`'s herdr-path substitution: herdr 0.9.1-preview moved
+  its install path from a fixed `AppData\...\bin\herdr.exe` location to a
+  version-hashed release directory, so the old code (comparing the command
+  text against one fixed constant) silently stopped rewriting TermRover's
+  script the moment herdr's real path changed -- TermRover then ran the
+  real (Windows-unsupported) `herdr terminal attach` instead of the shim,
+  with no error anywhere. Covers the new version-hashed path, the old fixed
+  path (backward compat), a herdr-path command with no `termrover-login`
+  marker (must pass through untouched), and a `termrover-login` command
+  with no herdr path at all (only the unrelated `ps -o ppid=` compat should
+  fire).
+
 ## Proving the mouse works without a human
 
 ```
