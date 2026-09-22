@@ -552,6 +552,14 @@ function runEmulate(herdrBin, session, termId, takeover, cols, rows) {
 
   // resize: forward the ssh channel's window-change (surfaced by wsshd as a
   // pty resize, which node reflects as a 'resize' event on process.stdout).
+  // Every change is forwarded, rows included. 2026-09-20 tried swallowing
+  // rows-only changes (assuming they were only the soft keyboard) and broke
+  // the view: TermRover always opens the pty one size, then corrects the row
+  // count ~0.4s later once its toolbar is laid out (50x52 -> 50x47 in every
+  // session's log). Swallowing that correction leaves herdr rendering frames
+  // taller than the phone's screen, and the bottom rows -- where the agent's
+  // input box lives -- fall off it. The pty is shared either way: this shim
+  // already resizes it at attach via `session control --cols --rows`.
   process.stdout.on('resize', () => {
     if (finished) return;
     const c = process.stdout.columns || cols;

@@ -126,6 +126,40 @@ untouched — no change needed here the day upstream fixes Windows.
   the terminal, so nothing visible sticks.
 - Unit test for the input filter: `node tests/termrover-attach-filter.test.js`.
 
+## phone-view: text-only client for phone SSH sessions
+
+A read-only, no-side-effect CLI for following a herdr agent from a phone
+SSH client's plain text terminal. Unlike `termrover-attach`'s live-attach
+mode, it never becomes a herdr client and never resizes the shared pty --
+it only shells out to `herdr agent list/read/prompt/send-keys/wait`.
+
+```
+ssh -p 2222 user@host node C:/Users/<u>/wssh-relay/phone-view
+```
+
+or, from an already-connected bash prompt: `cd ~/wssh-relay && ./phone-view`
+(the wrapper is a `#!/bin/sh` script that resolves its own directory through
+`cygpath -m` -- same MSYS path-rewriting workaround `termrover-attach` uses
+-- and execs `phone-view.py` with `PYTHONIOENCODING=utf-8` set).
+
+Pick an agent by number from the list, then at the prompt:
+
+| Command | Does |
+|---|---|
+| `<text>` + enter | send to the current agent (`agent prompt`) |
+| `:k <key...>` | send keys (`agent send-keys`), e.g. `:k down enter` |
+| `:n <N>` | change how many lines to look back (default 200) |
+| `:w` | wait for the agent to go idle (`agent wait --until idle`) |
+| `:a` | switch to the real-time view (`termrover-attach --takeover`); `ctrl+b q` leaves it and returns here, redrawn |
+| `:q` | while following: back to the list; in the list: quit |
+| `:h` | this help |
+
+Each poll only ever prints the lines newly scrolled off the top of the
+viewport since the last poll (an incremental tail over the stable region of
+the snapshot, capped at one screen per poll on a resync) -- not a full
+repaint. `c3_phone_view_replay.py` below is what that behavior is tested
+against.
+
 ## Tests
 
 Run a `.js` test with `node tests/<file>.js` and a `.py` test with
@@ -186,6 +220,35 @@ fails alone.
   then execs Moshi's real attach command (pulled from `wsshd.log`, targeting
   `sbtest`) against a real wsshd instance, plus the bash regression and the
   crash-guard check on the pty path.
+
+### phone-view (20260920-phone-view)
+
+- `c1_phone_view_unit.py` -- unit tests: CJK-display-width-aware line
+  wrapping, the stable/active viewport split, the incremental-tail
+  computation, and `--print-cmd` command construction (spaces / Chinese /
+  quotes).
+- `c2_phone_view_live.py` -- live probe against a real herdr pane. Slow
+  (some probes take minutes); not part of routine test runs -- `python -m
+  py_compile tests/c2_phone_view_live.py` is enough to catch syntax
+  regressions day to day.
+- `c3_phone_view_replay.py` -- deterministic replay: drives phone-view.py's
+  real `split_by_viewport` / `stable_increment_with_marker` functions over a
+  captured scrollback corpus through scroll/resync scenarios A-F (steady
+  scroll, random scroll, an unreconcilable jump, and -- scenarios E/F -- a
+  retroactive rewrite deep in the stable region, i.e. Claude Code folding a
+  finished tool output into `... +N lines (ctrl+o to expand)` after it has
+  already scrolled off screen).
+
+  Uses `tests/fixtures/replay_corpus.txt`, a real capture, when present:
+  ```
+  herdr agent read <pane> --source recent-unwrapped --lines 1000 --format text > server/tests/fixtures/replay_corpus.txt
+  ```
+  That file is gitignored and **not** committed here (this repo is public;
+  a captured pane can have anything on screen). When it's absent, the test
+  falls back to a built-in, deterministically-seeded synthetic corpus with
+  the same structural noise a real capture has (long CJK / mixed / ASCII
+  lines, box-drawing lines, blank lines, fold-marker lines) and prints which
+  corpus it used.
 
 ## Proving the mouse works without a human
 

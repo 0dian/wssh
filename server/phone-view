@@ -1,0 +1,14 @@
+#!/bin/sh
+# phone-view -- text-only herdr client entry point for phone SSH sessions.
+#
+# Only shells out to `herdr agent list/read/prompt/send-keys/wait` (see
+# phone-view.py's module docstring). Never becomes a herdr client, never
+# resizes the shared pty.
+#
+# Same MSYS path quirk as termrover-attach (see that wrapper's comment):
+# wsshd execs everything with MSYS_NO_PATHCONV=1, so a bare POSIX path like
+# /c/Users/.../phone-view.py is never rewritten for native python.exe, and
+# python cannot find it. cygpath -m converts explicitly and keeps this
+# wrapper relocatable.
+export PYTHONIOENCODING=utf-8
+exec python "$(cygpath -m "$(dirname "$0")")/phone-view.py" "$@"

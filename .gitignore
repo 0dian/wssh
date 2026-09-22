@@ -4,3 +4,8 @@
 
 .DS_Store
 node_modules/
+
+# Real captured pane scrollback for c3_phone_view_replay.py -- can contain
+# whatever was on screen when it was captured; this repo is public. The test
+# falls back to a synthetic corpus when this file is absent.
+server/tests/fixtures/replay_corpus.txt
