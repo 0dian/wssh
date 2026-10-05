@@ -399,7 +399,7 @@ function runInPipes(channel, command, st, peer) {
   // cannot yet send), and once it lands the stale slots are cleared so the next
   // CHANNEL_WINDOW_ADJUST can only ever pick a genuinely pending chunk.
   // Completion state, declared up here because the pump below consults it.
-  let stdoutEnded = false, stderrEnded = false, childClosed = false;
+  let stdoutEnded = false, stderrEnded = false, childClosed = false, childExited = false;
   let exitCode = 0, exitSignal = null, finished = false;
   const queue = [];
   let writing = false;
@@ -529,6 +529,10 @@ function runInPipes(channel, command, st, peer) {
     stdoutEnded = true; finish();
   });
   child.stderr.on('end', () => { stderrEnded = true; finish(); });
+  // 'exit' (the process is gone, its pid may already belong to somebody else)
+  // comes before 'close' (all stdio drained). A backgrounded `xxx &` that
+  // inherited stdout keeps the gap between the two open for as long as it runs.
+  child.on('exit', () => { childExited = true; });
   child.on('close', (code, signal) => {
     if (finished) return;
     childClosed = true;
@@ -539,8 +543,37 @@ function runInPipes(channel, command, st, peer) {
     exitSignal = signal;
     finish();
   });
-  channel.on('close', () => { if (!finished) { finished = true; try { child.kill(); } catch (e) {} try { child.stdout.destroy(); child.stderr.destroy(); } catch (e) {} log(peer + ' ' + tag + ' pid=' + child.pid + ' channel closed'); } });
+  channel.on('close', () => { if (!finished) { finished = true; killTree(child, childExited, peer, tag); try { child.stdout.destroy(); child.stderr.destroy(); } catch (e) {} log(peer + ' ' + tag + ' pid=' + child.pid + ' channel closed'); } });
   channel.on('error', e => log(peer + ' channel error: ' + e));
+}
+
+// Client went away while the exec'd command was still running. On Windows
+// child.kill() is TerminateProcess on the direct child only, and that child is
+// Git for Windows' bin\bash.exe launcher: the real usr\bin\bash.exe and the
+// command itself are its descendants, and Windows does not end descendants
+// along with their parent -- they would run on forever as orphans (a `ssh -N
+// -R` tunnel keeping its remote port, a `tail -f`, ...). taskkill /T walks the
+// ParentProcessId links and ends the whole tree. Async (execFile): other
+// clients live in this same process. If the child already exited (the 'exit'
+// event -- not 'close', which waits for stdio to drain) its pid may belong to
+// somebody else by now, so that case never reaches taskkill. Known limit: once
+// the direct child is gone, grandchildren it left running in the background can
+// no longer be located through the process tree and are not ended (that would
+// take a Job Object). Same root cause, accepted: if the child ends on its own in
+// the ~0.1 s before taskkill opens the pid, a brand-new process could get it.
+function killTree(child, childExited, peer, tag) {
+  if (process.platform !== 'win32' || childExited || !child.pid) {
+    try { child.kill(); } catch (e) {}
+    return;
+  }
+  const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+  const fallback = err => {
+    log(peer + ' ' + tag + ' pid=' + child.pid + ' taskkill failed: ' + String(err && err.message || err).trim());
+    try { child.kill(); } catch (e) {}
+  };
+  try {
+    execFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, err => { if (err) fallback(err); });
+  } catch (e) { fallback(e); }
 }
 
 function onSession(client, peer, accept) {

@@ -184,6 +184,20 @@ or from the `~/wssh-relay` deploy layout.
   `WSSHD_POWERSHELL` at a nonexistent path and asserts the one bad spawn
   fails cleanly, without crashing wsshd or hanging any other client.
 
+### Exec tree kill (20261005-wsshd-exec-tree-kill)
+
+- `f1_exec_tree_kill_e2e.js` -- end-to-end, on temporary port 2296 (never the
+  production 2222): after a pipe-mode `exec` channel is closed or the whole
+  connection drops, every descendant process of that exec (snapshotted
+  from the test wsshd's pid via `Get-CimInstance Win32_Process`) must be gone
+  within 5 s; closing one session must leave another session's processes
+  alone; normal exits (`echo hi`, `exit 3`, stdin through `cat`) are
+  unchanged and never reach `taskkill`; a channel closed after the direct child
+  has already exited but before its stdio closed (a backgrounded `sleep 37 &`
+  still holding stdout) must not run `taskkill` against the dead, possibly
+  recycled pid. Also reports, without asserting, how many processes a pty-path
+  `exec` leaves behind (`INFO pty-path survivors=`).
+
 ### TermRover herdr fleet coverage (backfill for the feature shipped in 4506d0d)
 
 These test the official/emulate detection and the e2e attach/detach replay
